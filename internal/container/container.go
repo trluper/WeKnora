@@ -58,6 +58,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
+	"github.com/Tencent/WeKnora/internal/datahub"
 	"github.com/Tencent/WeKnora/internal/datasource"
 	confluenceConnector "github.com/Tencent/WeKnora/internal/datasource/connector/confluence"
 	dingtalkConnector "github.com/Tencent/WeKnora/internal/datasource/connector/dingtalk"
@@ -132,6 +133,10 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initDatabase))
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))
+	// Datahub module: self-contained, disabled unless the deployment uses
+	// S3-compatible object storage. It fails startup only in the case where
+	// it is configured but unsupported (see docs/adr/0002, docs/adr/0004).
+	must(container.Provide(datahub.New))
 	must(container.Provide(initAntsPool))
 
 	must(container.Invoke(registerLangfuseCleanup))
