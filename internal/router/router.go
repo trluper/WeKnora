@@ -15,6 +15,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/datahub"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -31,6 +32,7 @@ type RouterParams struct {
 	dig.In
 
 	Config                       *config.Config
+	Datahub                      *datahub.Module
 	FileService                  interfaces.FileService
 	UserService                  interfaces.UserService
 	KBService                    interfaces.KnowledgeBaseService
@@ -255,6 +257,11 @@ func NewRouter(params RouterParams) *gin.Engine {
 		// apiKeyGroup helpers. Must be attached BEFORE the Register* calls
 		// so that sub-groups inherit it.
 		v1.Use(rbacGuards.apiKeyAuthorizer.Middleware())
+
+		// Datahub is a self-contained module: it owns its tables, routes and
+		// vocabulary, and mounts nothing at all unless the deployment is
+		// configured for it. See CONTEXT.md and docs/adr/0001..0005.
+		datahub.RegisterRoutes(v1, params.Datahub)
 
 		RegisterAuthRoutes(v1, params.AuthHandler, rbacGuards)
 		RegisterTenantRoutes(v1, params.TenantHandler, params.TenantMemberHandler, params.TenantInvitationHandler, params.AuditLogHandler, rbacGuards)
