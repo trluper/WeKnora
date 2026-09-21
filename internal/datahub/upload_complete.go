@@ -143,6 +143,21 @@ func (m *Module) completeUpload(c *gin.Context) {
 		return
 	}
 
+	// Some S3 implementations (MinIO among them) do not report Last-Modified or
+	// the content type from CompleteMultipartUpload, so ask for the object's own
+	// facts once. Best-effort: a failed probe leaves the reconciler to fill them
+	// in later rather than failing an upload that has already been merged.
+	if probed, probeErr := m.objects.StatObject(ctx, record.Bucket, record.ObjectKey); probeErr == nil {
+		if probed.ETag == "" {
+			probed.ETag = facts.ETag
+		}
+		facts = probed
+	} else {
+		logger.Warnf(ctx,
+			"[Datahub] could not read back facts after merge upload_id=%s: %v",
+			req.UploadID, probeErr)
+	}
+
 	merged, err := m.store.FinalizeUploadMerge(ctx, caller.TenantID, req.UploadID, facts, ProductMetadata{
 		Description:  req.Description,
 		Category:     req.Category,

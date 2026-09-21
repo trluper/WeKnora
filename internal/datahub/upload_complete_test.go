@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
@@ -143,6 +144,55 @@ func TestCompleteUploadIsIdempotent(t *testing.T) {
 	require.Equal(t, http.StatusOK, second.Code, "body=%s", second.Body.String())
 	require.Equal(t, 1, objects.completeCalls, "the merge happens once")
 	require.Equal(t, string(StatusMerged), completeResponse(t, second).Status)
+}
+
+func TestCompleteUploadRecordsTheObjectsOwnFacts(t *testing.T) {
+	// The merge call reports less than object storage knows — MinIO returns no
+	// last-modified or content type from CompleteMultipartUpload — so complete
+	// reads the object back and records what it actually is.
+	merged := ObjectInfo{
+		ETag:         "merged-etag",
+		VersionID:    "version-1",
+		ContentType:  "application/vnd.ms-excel",
+		Size:         10485760,
+		LastModified: time.Now().UTC().Add(-time.Minute),
+	}
+	objects := &fakeObjectStore{
+		storedParts: uploadedParts(),
+		objectFacts: map[string]ObjectInfo{
+			"event-1/2026/09/21/upload-1/board-report.xlsx": merged,
+		},
+	}
+	store := &fakeUploadStore{}
+	seedUpload(store, 42, "user-1", 3, StatusUploading)
+	engine := newTestEngine(newInitTestModule(objects, store), caller())
+
+	rec := postJSON(t, engine, completePath, completeBody())
+
+	require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, merged.VersionID, store.mergeFacts.VersionID)
+	require.Equal(t, int64(10485760), store.mergeFacts.Size)
+	require.WithinDuration(t, merged.LastModified, store.mergeFacts.LastModified, time.Second)
+	record := store.records["upload-1"]
+	require.NotNil(t, record.LastModified, "the fact the merge call omitted is recorded")
+}
+
+func TestCompleteUploadSurvivesAFailedFactProbe(t *testing.T) {
+	// Object storage merged the upload; failing to read the facts back must not
+	// fail the upload. The reconciler fills them in on its next pass.
+	objects := &fakeObjectStore{
+		storedParts: uploadedParts(),
+		statErr:     errors.New("head request timed out"),
+	}
+	store := &fakeUploadStore{}
+	seedUpload(store, 42, "user-1", 3, StatusUploading)
+	engine := newTestEngine(newInitTestModule(objects, store), caller())
+
+	rec := postJSON(t, engine, completePath, completeBody())
+
+	require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, "merged-etag", store.records["upload-1"].ETag)
+	require.Equal(t, StatusMerged, store.records["upload-1"].Status)
 }
 
 func TestCompleteUploadRefusesWhenNothingWasUploaded(t *testing.T) {

@@ -282,6 +282,16 @@ func (f *fakeUploadStore) FinalizeUploadMerge(
 	record.Status = StatusMerged
 	record.ETag = facts.ETag
 	record.ObjectVersionID = facts.VersionID
+	if facts.ContentType != "" {
+		record.ContentType = facts.ContentType
+	}
+	if facts.Size > 0 {
+		record.FileSize = facts.Size
+	}
+	if !facts.LastModified.IsZero() {
+		lastModified := facts.LastModified
+		record.LastModified = &lastModified
+	}
 	record.Description = product.Description
 	record.Category = product.Category
 	record.ImportantKey = product.ImportantKey
