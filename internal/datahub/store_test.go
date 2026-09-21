@@ -3,6 +3,7 @@ package datahub
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -150,19 +151,29 @@ func TestDatahubMigrationAndStoreRoundTrip(t *testing.T) {
 	err = store.Create(ctx, duplicate, duplicateParts)
 	require.Error(t, err)
 
-	// Our migration must roll back and forward cleanly.
-	require.NoError(t, m.Steps(-1), "down migration")
+	// Datahub's migrations must roll back and forward cleanly. Roll back to the
+	// version below the first of them rather than "one step", so this keeps
+	// working as the module gains migrations.
+	latest, dirty, err := m.Version()
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.NoError(t, m.Migrate(datahubFirstMigration-1), "down migrations")
 	var tables int
 	require.NoError(t, db.Raw(
 		`SELECT count(*) FROM information_schema.tables
-		 WHERE table_name IN ('datahub_uploads', 'datahub_upload_parts')`,
+		 WHERE table_name IN ('datahub_uploads', 'datahub_upload_parts',
+		                      'datahub_test_details', 'datahub_test_summaries')`,
 	).Scan(&tables).Error)
-	require.Zero(t, tables, "the down migration removes both tables")
+	require.Zero(t, tables, "the down migrations remove every Datahub table")
 
-	require.NoError(t, m.Steps(1), "up migration again")
+	require.NoError(t, m.Migrate(latest), "up migrations again")
 	_, err = store.Get(ctx, 7, "upload-round-trip")
 	require.ErrorIs(t, err, ErrUploadNotFound, "the table came back empty")
 }
+
+// datahubFirstMigration is the version of Datahub's first migration; rolling
+// back to one below it leaves the module's tables dropped.
+const datahubFirstMigration = 108
 
 func TestDatahubStoreCreateIsAtomic(t *testing.T) {
 	dsn := testPostgresDSN(t)
@@ -491,4 +502,141 @@ func TestDatahubListUploadsAgainstPostgres(t *testing.T) {
 	otherTenant, err := store.ListUploads(ctx, UploadQuery{TenantID: 21, Count: 50})
 	require.NoError(t, err)
 	require.Zero(t, otherTenant.Total)
+}
+
+func TestDatahubUpsertTestDetailsAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, _ := openTestStore(t, dsn)
+	store := NewPostgresTestDataStore(db)
+	ctx := context.Background()
+
+	readSummary := func(tenantID uint64, eventID string) TestSummary {
+		t.Helper()
+		var summary TestSummary
+		require.NoError(t, db.Raw(
+			`SELECT * FROM datahub_test_summaries WHERE tenant_id = ? AND event_id = ?`,
+			tenantID, eventID,
+		).Scan(&summary).Error)
+		return summary
+	}
+	countDetails := func(tenantID uint64, eventID string) int64 {
+		t.Helper()
+		var count int64
+		require.NoError(t, db.Raw(
+			`SELECT count(*) FROM datahub_test_details WHERE tenant_id = ? AND event_id = ?`,
+			tenantID, eventID,
+		).Scan(&count).Error)
+		return count
+	}
+
+	batch := []TestDetailInput{
+		{EventID: "event-td", BoardID: "board-1", TestResult: TestResultPassed, UserID: "user-a"},
+		{EventID: "event-td", BoardID: "board-2", TestResult: TestResultPassed, UserID: "user-a"},
+		{EventID: "event-td", BoardID: "board-3", TestResult: TestResultFailed,
+			FailedReason: "焊点虚接", UserID: "user-b"},
+	}
+	first, err := store.UpsertTestDetails(ctx, 30, "event-td", batch)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), first.Inserted)
+	require.Zero(t, first.Updated)
+
+	summary := readSummary(30, "event-td")
+	require.Equal(t, int64(3), summary.TotalCount)
+	require.Equal(t, int64(2), summary.PassedCount)
+	require.Equal(t, int64(1), summary.FailedCount)
+
+	// Replaying the batch writes no second row and moves nothing.
+	replay, err := store.UpsertTestDetails(ctx, 30, "event-td", batch)
+	require.NoError(t, err)
+	require.Zero(t, replay.Inserted)
+	require.Equal(t, int64(3), replay.Updated)
+	require.Equal(t, int64(3), countDetails(30, "event-td"))
+	summary = readSummary(30, "event-td")
+	require.Equal(t, int64(3), summary.TotalCount)
+	require.Equal(t, int64(2), summary.PassedCount)
+	require.Equal(t, int64(1), summary.FailedCount)
+
+	// A corrected verdict flips one count each way; the total does not move.
+	flip, err := store.UpsertTestDetails(ctx, 30, "event-td", []TestDetailInput{
+		{EventID: "event-td", BoardID: "board-2", TestResult: TestResultFailed,
+			FailedReason: "复测不合格", UserID: "user-a"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), flip.Updated)
+	summary = readSummary(30, "event-td")
+	require.Equal(t, int64(3), summary.TotalCount)
+	require.Equal(t, int64(1), summary.PassedCount)
+	require.Equal(t, int64(2), summary.FailedCount)
+
+	// Re-stating the same verdict is a no-op, not drift.
+	_, err = store.UpsertTestDetails(ctx, 30, "event-td", []TestDetailInput{
+		{EventID: "event-td", BoardID: "board-2", TestResult: TestResultFailed,
+			FailedReason: "复测不合格", UserID: "user-a"},
+	})
+	require.NoError(t, err)
+	summary = readSummary(30, "event-td")
+	require.Equal(t, int64(3), summary.TotalCount)
+	require.Equal(t, int64(1), summary.PassedCount)
+	require.Equal(t, int64(2), summary.FailedCount)
+
+	// Two clients writing different boards of the same Event at once: the
+	// Event-level lock must keep both batches and neither may lose an update.
+	batches := [][]TestDetailInput{
+		makeTestDetails("event-race", "board-1", 10, TestResultPassed, "user-a"),
+		makeTestDetails("event-race", "board-2", 10, TestResultFailed, "user-b"),
+	}
+	errs := make([]error, len(batches))
+	var wg sync.WaitGroup
+	for i, rows := range batches {
+		wg.Add(1)
+		go func(index int, rows []TestDetailInput) {
+			defer wg.Done()
+			_, errs[index] = store.UpsertTestDetails(ctx, 30, "event-race", rows)
+		}(i, rows)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoErrorf(t, err, "batch %d", i)
+	}
+	raceSummary := readSummary(30, "event-race")
+	require.Equal(t, int64(20), raceSummary.TotalCount)
+	require.Equal(t, int64(10), raceSummary.PassedCount)
+	require.Equal(t, int64(10), raceSummary.FailedCount)
+
+	// The same Event id in another tenant is a different Event entirely.
+	_, err = store.UpsertTestDetails(ctx, 31, "event-td", []TestDetailInput{
+		{EventID: "event-td", BoardID: "board-9", TestResult: TestResultPassed, UserID: "user-z"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), readSummary(31, "event-td").TotalCount)
+	require.Equal(t, int64(3), readSummary(30, "event-td").TotalCount,
+		"another tenant's write must not touch this tenant's summary")
+}
+
+func makeTestDetails(
+	eventID, boardPrefix string, count int, result int, userID string,
+) []TestDetailInput {
+	rows := make([]TestDetailInput, 0, count)
+	for i := 1; i <= count; i++ {
+		rows = append(rows, TestDetailInput{
+			EventID:    eventID,
+			BoardID:    fmt.Sprintf("%s-%d", boardPrefix, i),
+			TestResult: result,
+			UserID:     userID,
+			FailedReason: func() string {
+				if result == TestResultFailed {
+					return "不合格"
+				}
+				return ""
+			}(),
+		})
+	}
+	return rows
 }

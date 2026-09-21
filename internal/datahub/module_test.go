@@ -314,6 +314,71 @@ func seedUpload(
 	return record
 }
 
+// fakeTestDataStore mirrors the real store's contract: a board re-reported in
+// place is an update, and the Event's summary moves by exactly the difference.
+type fakeTestDataStore struct {
+	details map[string]map[string]int
+	summary map[string]TestSummary
+
+	err      error
+	calls    int
+	lastRows map[string][]TestDetailInput
+}
+
+var _ TestDataStore = (*fakeTestDataStore)(nil)
+
+func newFakeTestDataStore() *fakeTestDataStore {
+	return &fakeTestDataStore{
+		details:  map[string]map[string]int{},
+		summary:  map[string]TestSummary{},
+		lastRows: map[string][]TestDetailInput{},
+	}
+}
+
+func (f *fakeTestDataStore) UpsertTestDetails(
+	_ context.Context, _ uint64, eventID string, rows []TestDetailInput,
+) (*UpsertTestDetailsResult, error) {
+	f.calls++
+	f.lastRows[eventID] = rows
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.details[eventID] == nil {
+		f.details[eventID] = map[string]int{}
+	}
+
+	result := &UpsertTestDetailsResult{}
+	summary := f.summary[eventID]
+	summary.EventID = eventID
+	for _, row := range rows {
+		previous, existed := f.details[eventID][row.BoardID]
+		switch {
+		case !existed:
+			result.Inserted++
+			summary.TotalCount++
+			if row.TestResult == TestResultPassed {
+				summary.PassedCount++
+			} else {
+				summary.FailedCount++
+			}
+		case previous != row.TestResult:
+			result.Updated++
+			if row.TestResult == TestResultPassed {
+				summary.PassedCount++
+				summary.FailedCount--
+			} else {
+				summary.PassedCount--
+				summary.FailedCount++
+			}
+		default:
+			result.Updated++
+		}
+		f.details[eventID][row.BoardID] = row.TestResult
+	}
+	f.summary[eventID] = summary
+	return result, nil
+}
+
 func envFrom(pairs map[string]string) func(string) string {
 	return func(key string) string { return pairs[key] }
 }

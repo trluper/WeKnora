@@ -94,3 +94,41 @@ type UploadParts struct {
 }
 
 func (UploadParts) TableName() string { return "datahub_upload_parts" }
+
+// Test verdicts. A board either passed or failed; there is no third state, so
+// anything else a client sends is rejected rather than stored.
+const (
+	TestResultFailed = 0
+	TestResultPassed = 1
+)
+
+// TestDetail is one board's verdict within an Event. Re-reporting a board is a
+// correction, so (tenant, event, board) is unique.
+type TestDetail struct {
+	ID           int64     `gorm:"column:id;primaryKey"`
+	TenantID     uint64    `gorm:"column:tenant_id"`
+	EventID      string    `gorm:"column:event_id"`
+	BoardID      string    `gorm:"column:board_id"`
+	TestResult   int16     `gorm:"column:test_result"`
+	FailedReason string    `gorm:"column:failed_reason"`
+	UserID       string    `gorm:"column:user_id"`
+	CreatedAt    time.Time `gorm:"column:created_at"`
+	UpdatedAt    time.Time `gorm:"column:updated_at"`
+}
+
+func (TestDetail) TableName() string { return "datahub_test_details" }
+
+// TestSummary is one Event's overall test progress, aggregated across everyone
+// who recorded a board for it.
+type TestSummary struct {
+	ID          int64     `gorm:"column:id;primaryKey"`
+	TenantID    uint64    `gorm:"column:tenant_id"`
+	EventID     string    `gorm:"column:event_id"`
+	TotalCount  int64     `gorm:"column:total_count"`
+	PassedCount int64     `gorm:"column:passed_count"`
+	FailedCount int64     `gorm:"column:failed_count"`
+	CreatedAt   time.Time `gorm:"column:created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at"`
+}
+
+func (TestSummary) TableName() string { return "datahub_test_summaries" }

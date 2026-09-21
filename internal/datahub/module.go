@@ -26,15 +26,17 @@ type Module struct {
 	redis    *redis.Client
 	objects  ObjectStore
 	store    UploadStore
+	testData TestDataStore
 }
 
 // Parts are the collaborators a Module runs on. Grouping them keeps the
 // constructor readable as later tickets add to it.
 type Parts struct {
-	DB      *gorm.DB
-	Redis   *redis.Client
-	Objects ObjectStore
-	Store   UploadStore
+	DB       *gorm.DB
+	Redis    *redis.Client
+	Objects  ObjectStore
+	Store    UploadStore
+	TestData TestDataStore
 }
 
 // New builds the Datahub module from the deployment environment.
@@ -64,10 +66,11 @@ func New(db *gorm.DB, redisClient *redis.Client) (*Module, error) {
 		"[Datahub] enabled: provider=%s bucket=%s",
 		settings.ObjectStorage.Provider, settings.ObjectStorage.Bucket)
 	return newModule(settings, Parts{
-		DB:      db,
-		Redis:   redisClient,
-		Objects: objects,
-		Store:   NewPostgresUploadStore(db),
+		DB:       db,
+		Redis:    redisClient,
+		Objects:  objects,
+		Store:    NewPostgresUploadStore(db),
+		TestData: NewPostgresTestDataStore(db),
 	}), nil
 }
 
@@ -80,6 +83,7 @@ func newModule(settings Settings, parts Parts) *Module {
 		redis:    parts.Redis,
 		objects:  parts.Objects,
 		store:    parts.Store,
+		testData: parts.TestData,
 	}
 }
 
@@ -98,6 +102,7 @@ func RegisterRoutes(group *gin.RouterGroup, module *Module) {
 	datahub.GET("/upload/:upload_id/parts", module.listUploadParts)
 	datahub.GET("/upload/versions", module.listUploadVersions)
 	datahub.POST("/upload/metadata", module.searchUploadMetadata)
+	datahub.POST("/test-data/batch-upload", module.uploadTestData)
 }
 
 // requireCaller rejects requests that reached the module without an
