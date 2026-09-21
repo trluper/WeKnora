@@ -29,6 +29,13 @@ type fakeObjectStore struct {
 	completeErr   error
 	completeCalls int
 	completedWith []CompletedPart
+
+	objectFacts    map[string]ObjectInfo
+	statErr        error
+	statCalls      int
+	listedObjects  []ObjectRef
+	listObjectsErr error
+	listTruncated  bool
 }
 
 var _ ObjectStore = (*fakeObjectStore)(nil)
@@ -84,6 +91,34 @@ func (f *fakeObjectStore) AbortMultipartUpload(_ context.Context, _, _, uploadID
 	return f.abortErr
 }
 
+func (f *fakeObjectStore) StatObject(
+	_ context.Context, _, objectKey string,
+) (ObjectInfo, error) {
+	f.statCalls++
+	if f.statErr != nil {
+		return ObjectInfo{}, f.statErr
+	}
+	if facts, ok := f.objectFacts[objectKey]; ok {
+		return facts, nil
+	}
+	return ObjectInfo{}, fmt.Errorf("%w: %s", ErrObjectNotFound, objectKey)
+}
+
+func (f *fakeObjectStore) ListObjects(
+	_ context.Context, _, _ string, limit int,
+) ([]ObjectRef, bool, error) {
+	if f.listObjectsErr != nil {
+		return nil, false, f.listObjectsErr
+	}
+	objects := f.listedObjects
+	truncated := f.listTruncated
+	if limit > 0 && len(objects) > limit {
+		objects = objects[:limit]
+		truncated = true
+	}
+	return objects, truncated, nil
+}
+
 // fakeUploadStore records what the upload flow tried to persist, and can be
 // told to fail so the "database write failed" abort path is testable without a
 // database.
@@ -114,6 +149,13 @@ type fakeUploadStore struct {
 	expireCalls    int
 	markedExpired  []string
 	markExpiredErr error
+
+	needingFacts    []UploadRecord
+	needingFactsErr error
+	factUpdates     map[string]ObjectInfo
+	updateFactErr   error
+	knownKeys       []string
+	knownKeysErr    error
 }
 
 var _ UploadStore = (*fakeUploadStore)(nil)
@@ -324,6 +366,57 @@ func (f *fakeUploadStore) MarkUploadExpired(
 		}
 	}
 	return nil
+}
+
+// ListUploadsNeedingFacts, UpdateUploadFacts and KnownObjectKeys mirror the real
+// store's contract. UpdateUploadFacts records only what the real one writes, so
+// a test can assert the other columns were left alone.
+func (f *fakeUploadStore) ListUploadsNeedingFacts(
+	_ context.Context, limit int,
+) ([]UploadRecord, error) {
+	if f.needingFactsErr != nil {
+		return nil, f.needingFactsErr
+	}
+	records := f.needingFacts
+	if limit > 0 && len(records) > limit {
+		records = records[:limit]
+	}
+	return records, nil
+}
+
+func (f *fakeUploadStore) UpdateUploadFacts(
+	_ context.Context, tenantID uint64, uploadID string, facts ObjectInfo,
+) error {
+	if f.updateFactErr != nil {
+		return f.updateFactErr
+	}
+	if f.factUpdates == nil {
+		f.factUpdates = map[string]ObjectInfo{}
+	}
+	f.factUpdates[uploadID] = facts
+	if record, ok := f.records[uploadID]; ok && record.TenantID == tenantID {
+		record.ETag = facts.ETag
+		record.ObjectVersionID = facts.VersionID
+		if facts.Size > 0 {
+			record.FileSize = facts.Size
+		}
+		if !facts.LastModified.IsZero() {
+			lastModified := facts.LastModified
+			record.LastModified = &lastModified
+		}
+	}
+	return nil
+}
+
+func (f *fakeUploadStore) KnownObjectKeys(_ context.Context, limit int) ([]string, error) {
+	if f.knownKeysErr != nil {
+		return nil, f.knownKeysErr
+	}
+	keys := f.knownKeys
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	return keys, nil
 }
 
 // put seeds both maps; Create and the test fixtures both use it.

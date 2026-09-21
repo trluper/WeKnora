@@ -225,7 +225,7 @@ func (m *Module) abortMultipartUpload(ctx context.Context, bucket, objectKey, up
 // name cannot walk out of its prefix.
 func objectKeyFor(eventID, uploadID, filename string) string {
 	now := time.Now().UTC()
-	return path.Join(
+	return objectPrefix + path.Join(
 		eventID,
 		fmt.Sprintf("%d", now.Year()),
 		fmt.Sprintf("%02d", now.Month()),

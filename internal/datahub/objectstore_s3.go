@@ -2,6 +2,7 @@ package datahub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -156,6 +157,62 @@ func (s *s3ObjectStore) AbortMultipartUpload(
 		return fmt.Errorf("abort multipart upload: %w", err)
 	}
 	return nil
+}
+
+func (s *s3ObjectStore) StatObject(
+	ctx context.Context, bucket, objectKey string,
+) (ObjectInfo, error) {
+	info, err := s.client.StatObject(ctx, s.bucketName(bucket), objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		if isNoSuchKey(err) {
+			return ObjectInfo{}, fmt.Errorf("%w: %s", ErrObjectNotFound, objectKey)
+		}
+		return ObjectInfo{}, fmt.Errorf("stat object %s: %w", objectKey, err)
+	}
+	return ObjectInfo{
+		ETag:         info.ETag,
+		VersionID:    info.VersionID,
+		ContentType:  info.ContentType,
+		Size:         info.Size,
+		LastModified: info.LastModified,
+	}, nil
+}
+
+func (s *s3ObjectStore) ListObjects(
+	ctx context.Context, bucket, prefix string, limit int,
+) ([]ObjectRef, bool, error) {
+	objects := make([]ObjectRef, 0, 64)
+	truncated := false
+
+	for object := range s.client.ListObjects(ctx, s.bucketName(bucket), minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}) {
+		if object.Err != nil {
+			return nil, false, fmt.Errorf("list objects under %s: %w", prefix, object.Err)
+		}
+		if limit > 0 && len(objects) >= limit {
+			truncated = true
+			break
+		}
+		objects = append(objects, ObjectRef{
+			Key:          object.Key,
+			Size:         object.Size,
+			LastModified: object.LastModified,
+			ETag:         object.ETag,
+		})
+	}
+	return objects, truncated, nil
+}
+
+// isNoSuchKey recognises a missing object across the error shapes minio-go
+// returns for the S3 and MinIO backends.
+func isNoSuchKey(err error) bool {
+	var responseErr minio.ErrorResponse
+	if errors.As(err, &responseErr) {
+		return responseErr.Code == "NoSuchKey" || responseErr.Code == "NoSuchBucket"
+	}
+	return false
 }
 
 func (s *s3ObjectStore) bucketName(bucket string) string {

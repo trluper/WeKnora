@@ -13,6 +13,8 @@ import (
 const (
 	// taskTypeExpireUploads abandons uploads that were never finished.
 	taskTypeExpireUploads = "datahub:expire-uploads"
+	// taskTypeReconcileUploads compares the database against object storage.
+	taskTypeReconcileUploads = "datahub:reconcile-uploads"
 	// queueDatahub is Datahub's own queue. Only Datahub's worker consumes it, so
 	// the module adds no queue to any existing worker pool and cannot change how
 	// the rest of the system schedules work.
@@ -22,6 +24,12 @@ const (
 	expirySweepInterval = 10 * time.Minute
 	expiryBatchSize     = 500
 	expiryMaxRetry      = 5
+
+	// Reconciliation walks object storage, so it runs far less often than the
+	// expiry sweep.
+	reconcileInterval  = 6 * time.Hour
+	reconcileBatchSize = 500
+	reconcileListLimit = 5000
 
 	// expiryReason is what an abandoned Upload records, so an operator reading
 	// the row knows nobody failed — the client simply never finished.
@@ -52,6 +60,7 @@ func (m *Module) startBackgroundWorkers() error {
 	mux := asynq.NewServeMux()
 	mux.Use(asynqdl.MiddlewareWithCallback(m.deadLetters, nil))
 	mux.HandleFunc(taskTypeExpireUploads, m.handleExpireUploads)
+	mux.HandleFunc(taskTypeReconcileUploads, m.handleReconcileUploads)
 
 	// Datahub runs on the Redis client the rest of the server already built and
 	// pinged, so pooling, TLS and timeouts match the deployment without this
@@ -70,7 +79,7 @@ func (m *Module) startBackgroundWorkers() error {
 		client: asynq.NewClientFromRedisClient(m.redis),
 		stop:   make(chan struct{}),
 	}
-	go m.scheduleExpirySweeps(m.worker)
+	go m.scheduleSweeps(m.worker)
 
 	logger.Infof(context.Background(),
 		"[Datahub] background worker started: queue=%s interval=%s",
@@ -78,31 +87,37 @@ func (m *Module) startBackgroundWorkers() error {
 	return nil
 }
 
-// scheduleExpirySweeps enqueues the sweep periodically. The first sweep runs one
-// interval after startup, which also keeps it clear of migrations.
-func (m *Module) scheduleExpirySweeps(w *worker) {
-	ticker := time.NewTicker(expirySweepInterval)
-	defer ticker.Stop()
+// scheduleSweeps enqueues each background task on its own cadence. The first
+// tick lands one interval after startup, which also keeps both clear of
+// migrations.
+func (m *Module) scheduleSweeps(w *worker) {
+	expiry := time.NewTicker(expirySweepInterval)
+	reconcile := time.NewTicker(reconcileInterval)
+	defer expiry.Stop()
+	defer reconcile.Stop()
+
 	for {
 		select {
-		case <-ticker.C:
-			m.enqueueExpirySweep(w)
+		case <-expiry.C:
+			m.enqueue(w, taskTypeExpireUploads, expiryMaxRetry)
+		case <-reconcile.C:
+			m.enqueue(w, taskTypeReconcileUploads, expiryMaxRetry)
 		case <-w.stop:
 			return
 		}
 	}
 }
 
-// enqueueExpirySweep queues one sweep. Enqueue is a Redis write, so failing to
+// enqueue queues one background task. Enqueue is a Redis write, so failing to
 // schedule is logged and retried by the next tick rather than crashing.
-func (m *Module) enqueueExpirySweep(w *worker) {
-	task := asynq.NewTask(taskTypeExpireUploads, nil)
+func (m *Module) enqueue(w *worker, taskType string, maxRetry int) {
+	task := asynq.NewTask(taskType, nil)
 	if _, err := w.client.Enqueue(task,
 		asynq.Queue(queueDatahub),
-		asynq.MaxRetry(expiryMaxRetry),
+		asynq.MaxRetry(maxRetry),
 	); err != nil {
 		logger.Warnf(context.Background(),
-			"[Datahub] failed to enqueue the expiry sweep: %v", err)
+			"[Datahub] failed to enqueue %s: %v", taskType, err)
 	}
 }
 

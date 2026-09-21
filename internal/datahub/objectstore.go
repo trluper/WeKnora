@@ -2,8 +2,19 @@ package datahub
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrObjectNotFound means object storage does not hold the object or session the
+// caller asked about. It is distinct from "object storage is unreachable", which
+// is worth retrying.
+var ErrObjectNotFound = errors.New("datahub: object not found")
+
+// objectPrefix namespaces every object Datahub writes. Without it a reconciler
+// could not tell this module's objects from the files the rest of WeKnora keeps
+// in the same bucket, and orphan detection would have to guess.
+const objectPrefix = "datahub/"
 
 // ObjectStore is Datahub's one outbound port. Uploads go straight from the
 // client to object storage over pre-signed multipart URLs, so the module needs
@@ -36,6 +47,19 @@ type ObjectStore interface {
 	) (ObjectInfo, error)
 	// AbortMultipartUpload discards the session and its uploaded parts.
 	AbortMultipartUpload(ctx context.Context, bucket, objectKey, uploadID string) error
+	// StatObject reports one object's physical facts, or ErrObjectNotFound.
+	StatObject(ctx context.Context, bucket, objectKey string) (ObjectInfo, error)
+	// ListObjects returns the objects under prefix, bounded by limit; the bool
+	// reports whether the listing was truncated.
+	ListObjects(ctx context.Context, bucket, prefix string, limit int) ([]ObjectRef, bool, error)
+}
+
+// ObjectRef is one object found by listing a prefix.
+type ObjectRef struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+	ETag         string
 }
 
 // CompletedPart is one uploaded part as object storage knows it.
