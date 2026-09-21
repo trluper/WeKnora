@@ -306,3 +306,82 @@ func TestDatahubRegisterPartsSerialisesConcurrentBatches(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 4)
 }
+
+func TestDatahubCompleteUploadAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, store := openTestStore(t, dsn)
+	ctx := context.Background()
+
+	upload, parts := sampleUpload(13, "upload-complete")
+	require.NoError(t, store.Create(ctx, upload, parts))
+
+	require.NoError(t, store.ClaimUploadMerge(ctx, 13, "upload-complete"))
+	// Only one caller may hold the merge.
+	require.ErrorIs(t, store.ClaimUploadMerge(ctx, 13, "upload-complete"), ErrUploadNotUploading)
+
+	facts := ObjectInfo{
+		ETag:         "etag-final",
+		VersionID:    "version-9",
+		ContentType:  "application/vnd.ms-excel",
+		Size:         10485760,
+		LastModified: time.Now().UTC(),
+	}
+	product := ProductMetadata{
+		Description:  "第三季度板件测试报告",
+		Category:     "sensor",
+		ImportantKey: "板件,筛分",
+		Version:      "v3",
+	}
+	merged, err := store.FinalizeUploadMerge(ctx, 13, "upload-complete", facts, product)
+	require.NoError(t, err)
+	require.Equal(t, StatusMerged, merged.Status)
+	require.Equal(t, "etag-final", merged.ETag)
+	require.Equal(t, "version-9", merged.ObjectVersionID)
+	require.Equal(t, int64(10485760), merged.FileSize, "the real object size replaces the declared one")
+	require.Equal(t, merged.TotalParts, merged.CompletedParts)
+	require.NotNil(t, merged.CompletedAt)
+	require.Equal(t, product.Description, merged.Description)
+	require.Equal(t, product.Version, merged.Version)
+	require.Empty(t, merged.ErrorMessage)
+
+	// Merging twice is a state error, not a silent rewrite.
+	_, err = store.FinalizeUploadMerge(ctx, 13, "upload-complete", facts, product)
+	require.ErrorIs(t, err, ErrUploadNotUploading)
+
+	// The reserved columns must still be untouched by the upload flow.
+	var reserved struct {
+		SummaryMarkdown string
+		Headline        string
+		AnalysisState   string
+		KeywordCount    int
+	}
+	require.NoError(t, db.Raw(
+		`SELECT summary_markdown, headline, analysis_state,
+		        COALESCE(jsonb_array_length(keywords), 0) AS keyword_count
+		 FROM datahub_uploads WHERE tenant_id = ? AND upload_id = ?`,
+		13, "upload-complete",
+	).Scan(&reserved).Error)
+	require.Empty(t, reserved.SummaryMarkdown)
+	require.Empty(t, reserved.Headline)
+	require.Empty(t, reserved.AnalysisState)
+	require.Zero(t, reserved.KeywordCount)
+
+	// A failed merge is recorded with its reason and is terminal.
+	failedUpload, failedParts := sampleUpload(13, "upload-fail")
+	require.NoError(t, store.Create(ctx, failedUpload, failedParts))
+	require.NoError(t, store.ClaimUploadMerge(ctx, 13, "upload-fail"))
+
+	failed, err := store.FailUploadMerge(ctx, 13, "upload-fail", "part etag mismatch")
+	require.NoError(t, err)
+	require.Equal(t, StatusFailed, failed.Status)
+	require.Equal(t, "part etag mismatch", failed.ErrorMessage)
+	_, err = store.FailUploadMerge(ctx, 13, "upload-fail", "again")
+	require.ErrorIs(t, err, ErrUploadNotUploading)
+}

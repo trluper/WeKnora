@@ -94,6 +94,7 @@ func RegisterRoutes(group *gin.RouterGroup, module *Module) {
 	datahub.GET("/health", module.health)
 	datahub.POST("/upload/init", module.initUpload)
 	datahub.POST("/upload/part", module.registerUploadParts)
+	datahub.POST("/upload/complete", module.completeUpload)
 	datahub.GET("/upload/:upload_id/parts", module.listUploadParts)
 }
 

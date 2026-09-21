@@ -22,6 +22,12 @@ type fakeObjectStore struct {
 	presignErr   error
 	presignCalls int
 	aborted      []string
+
+	storedParts   []CompletedPart
+	listErr       error
+	completeErr   error
+	completeCalls int
+	completedWith []CompletedPart
 }
 
 var _ ObjectStore = (*fakeObjectStore)(nil)
@@ -49,13 +55,27 @@ func (f *fakeObjectStore) PresignUploadPart(
 func (f *fakeObjectStore) CompletedParts(
 	_ context.Context, _, _, _ string,
 ) ([]CompletedPart, error) {
-	return nil, nil
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.storedParts, nil
 }
 
 func (f *fakeObjectStore) CompleteMultipartUpload(
-	_ context.Context, _, _, _ string, _ []CompletedPart,
+	_ context.Context, _, _, _ string, parts []CompletedPart,
 ) (ObjectInfo, error) {
-	return ObjectInfo{ETag: "fake-etag"}, nil
+	if f.completeErr != nil {
+		return ObjectInfo{}, f.completeErr
+	}
+	f.completeCalls++
+	f.completedWith = parts
+	return ObjectInfo{
+		ETag:         "merged-etag",
+		VersionID:    "version-1",
+		ContentType:  "application/vnd.ms-excel",
+		Size:         10485760,
+		LastModified: time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC),
+	}, nil
 }
 
 func (f *fakeObjectStore) AbortMultipartUpload(_ context.Context, _, _, uploadID string) error {
@@ -76,6 +96,13 @@ type fakeUploadStore struct {
 	registerErr   error
 	registerCalls int
 	lastBatch     []CompletedPart
+
+	claimErr     error
+	finalizeErr  error
+	claims       int
+	mergeFacts   ObjectInfo
+	mergeProduct ProductMetadata
+	failReasons  []string
 }
 
 var _ UploadStore = (*fakeUploadStore)(nil)
@@ -166,6 +193,67 @@ func (f *fakeUploadStore) RegisterParts(
 	}, nil
 }
 
+func (f *fakeUploadStore) ClaimUploadMerge(
+	_ context.Context, tenantID uint64, uploadID string,
+) error {
+	f.claims++
+	if f.claimErr != nil {
+		return f.claimErr
+	}
+	record, ok := f.records[uploadID]
+	if !ok || record.TenantID != tenantID {
+		return ErrUploadNotFound
+	}
+	if record.Status != StatusUploading {
+		return ErrUploadNotUploading
+	}
+	record.Status = StatusMerging
+	return nil
+}
+
+func (f *fakeUploadStore) FinalizeUploadMerge(
+	_ context.Context, tenantID uint64, uploadID string,
+	facts ObjectInfo, product ProductMetadata,
+) (*UploadRecord, error) {
+	if f.finalizeErr != nil {
+		return nil, f.finalizeErr
+	}
+	record, ok := f.records[uploadID]
+	if !ok || record.TenantID != tenantID {
+		return nil, ErrUploadNotFound
+	}
+	if record.Status != StatusMerging {
+		return nil, ErrUploadNotUploading
+	}
+	f.mergeFacts, f.mergeProduct = facts, product
+	record.Status = StatusMerged
+	record.ETag = facts.ETag
+	record.ObjectVersionID = facts.VersionID
+	record.Description = product.Description
+	record.Category = product.Category
+	record.ImportantKey = product.ImportantKey
+	record.Version = product.Version
+	record.CompletedParts = record.TotalParts
+	record.ErrorMessage = ""
+	return record, nil
+}
+
+func (f *fakeUploadStore) FailUploadMerge(
+	_ context.Context, tenantID uint64, uploadID string, reason string,
+) (*UploadRecord, error) {
+	record, ok := f.records[uploadID]
+	if !ok || record.TenantID != tenantID {
+		return nil, ErrUploadNotFound
+	}
+	if record.Status != StatusMerging {
+		return nil, ErrUploadNotUploading
+	}
+	f.failReasons = append(f.failReasons, reason)
+	record.Status = StatusFailed
+	record.ErrorMessage = reason
+	return record, nil
+}
+
 // put seeds both maps; Create and the test fixtures both use it.
 func (f *fakeUploadStore) put(record *UploadRecord, parts *UploadParts) {
 	if f.records == nil {
@@ -181,17 +269,21 @@ func seedUpload(
 	store *fakeUploadStore, tenantID uint64, userID string, totalParts int, status UploadStatus,
 ) *UploadRecord {
 	record := &UploadRecord{
-		TenantID:   tenantID,
-		UploadID:   "upload-1",
-		EventID:    "event-1",
-		Scenario:   ScenarioExperiment,
-		UserID:     userID,
-		Filename:   "board-report.xlsx",
-		FileSize:   1024,
-		Status:     status,
-		TotalParts: totalParts,
-		PartSize:   defaultPartSize,
-		ExpireAt:   time.Now().UTC().Add(time.Hour),
+		TenantID:       tenantID,
+		UploadID:       "upload-1",
+		EventID:        "event-1",
+		Scenario:       ScenarioExperiment,
+		UserID:         userID,
+		Filename:       "board-report.xlsx",
+		FileSize:       1024,
+		Bucket:         "weknora",
+		ObjectKey:      "event-1/2026/09/21/upload-1/board-report.xlsx",
+		StoragePath:    "event-1/2026/09/21/upload-1/board-report.xlsx",
+		ObjectUploadID: "multipart-1",
+		Status:         status,
+		TotalParts:     totalParts,
+		PartSize:       defaultPartSize,
+		ExpireAt:       time.Now().UTC().Add(time.Hour),
 	}
 	parts := &UploadParts{
 		TenantID:   tenantID,

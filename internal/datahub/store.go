@@ -30,6 +30,15 @@ type RegisterPartsResult struct {
 	TotalParts     int
 }
 
+// ProductMetadata is what the client submits when finishing an upload: the
+// human-authored facts about the file, as opposed to what object storage knows.
+type ProductMetadata struct {
+	Description  string
+	Category     string
+	ImportantKey string
+	Version      string
+}
+
 // UploadStore is the persistence boundary for Upload records. It exists as an
 // interface so the upload flow's behaviour — including its failure paths — can
 // be exercised without a database; the Postgres implementation below is the
@@ -47,6 +56,21 @@ type UploadStore interface {
 	RegisterParts(
 		ctx context.Context, tenantID uint64, uploadID string, parts []CompletedPart,
 	) (*RegisterPartsResult, error)
+	// ClaimUploadMerge moves an Upload from uploading to merging so exactly one
+	// caller performs the merge. Returns ErrUploadNotUploading when it is not
+	// claimable (already merging, finished, cancelled, or failed).
+	ClaimUploadMerge(ctx context.Context, tenantID uint64, uploadID string) error
+	// FinalizeUploadMerge writes the object-storage facts and product metadata
+	// and moves the Upload to merged. It never touches the columns reserved for
+	// a future summarizer, so re-running it cannot clobber their output.
+	FinalizeUploadMerge(
+		ctx context.Context, tenantID uint64, uploadID string,
+		facts ObjectInfo, product ProductMetadata,
+	) (*UploadRecord, error)
+	// FailUploadMerge records why a merge failed and moves the Upload to failed.
+	FailUploadMerge(
+		ctx context.Context, tenantID uint64, uploadID string, reason string,
+	) (*UploadRecord, error)
 }
 
 // partMetaEntry is one registered part as stored. The sibling implementation
@@ -244,4 +268,142 @@ func (s *postgresUploadStore) RegisterParts(
 		return nil, err
 	}
 	return result, nil
+}
+
+func (s *postgresUploadStore) ClaimUploadMerge(
+	ctx context.Context, tenantID uint64, uploadID string,
+) error {
+	claimed := s.db.WithContext(ctx).Exec(`
+		UPDATE datahub_uploads
+		   SET status = ?, updated_at = ?
+		 WHERE tenant_id = ? AND upload_id = ? AND status = ?`,
+		StatusMerging, time.Now().UTC(), tenantID, uploadID, StatusUploading,
+	)
+	if claimed.Error != nil {
+		return fmt.Errorf("claim upload merge: %w", claimed.Error)
+	}
+	if claimed.RowsAffected == 0 {
+		// Tell "no such upload" apart from "not in a claimable state" so the
+		// caller can answer 404 rather than 409.
+		if _, err := s.Get(ctx, tenantID, uploadID); err != nil {
+			return err
+		}
+		return ErrUploadNotUploading
+	}
+	return nil
+}
+
+func (s *postgresUploadStore) FinalizeUploadMerge(
+	ctx context.Context, tenantID uint64, uploadID string,
+	facts ObjectInfo, product ProductMetadata,
+) (*UploadRecord, error) {
+	var record UploadRecord
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := lockUpload(tx, tenantID, uploadID)
+		if err != nil {
+			return err
+		}
+		if current.Status != StatusMerging {
+			return ErrUploadNotUploading
+		}
+
+		now := time.Now().UTC()
+		err = tx.Exec(`
+			UPDATE datahub_uploads
+			   SET status = ?,
+			       etag = ?, object_version_id = ?, last_modified = ?,
+			       file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+			       content_type = CASE WHEN ? <> '' THEN ? ELSE content_type END,
+			       description = ?, category = ?, important_key = ?, version = ?,
+			       completed_parts = total_parts,
+			       completed_at = ?, updated_at = ?, error_msg = ''
+			 WHERE tenant_id = ? AND upload_id = ?`,
+			StatusMerged,
+			facts.ETag, facts.VersionID, nullTime(facts.LastModified),
+			facts.Size, facts.Size,
+			facts.ContentType, facts.ContentType,
+			product.Description, product.Category, product.ImportantKey, product.Version,
+			now, now,
+			tenantID, uploadID,
+		).Error
+		if err != nil {
+			return fmt.Errorf("finalize upload merge: %w", err)
+		}
+
+		record, err = loadUpload(tx, tenantID, uploadID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+func (s *postgresUploadStore) FailUploadMerge(
+	ctx context.Context, tenantID uint64, uploadID string, reason string,
+) (*UploadRecord, error) {
+	var record UploadRecord
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := lockUpload(tx, tenantID, uploadID)
+		if err != nil {
+			return err
+		}
+		if current.Status != StatusMerging {
+			return ErrUploadNotUploading
+		}
+
+		now := time.Now().UTC()
+		if err := tx.Exec(`
+			UPDATE datahub_uploads
+			   SET status = ?, error_msg = ?, updated_at = ?
+			 WHERE tenant_id = ? AND upload_id = ?`,
+			StatusFailed, reason, now, tenantID, uploadID,
+		).Error; err != nil {
+			return fmt.Errorf("fail upload merge: %w", err)
+		}
+
+		record, err = loadUpload(tx, tenantID, uploadID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+// lockUpload takes the row lock the merge transitions rely on.
+func lockUpload(tx *gorm.DB, tenantID uint64, uploadID string) (*UploadRecord, error) {
+	var record UploadRecord
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("tenant_id = ? AND upload_id = ?", tenantID, uploadID).
+		Take(&record).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrUploadNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock upload record: %w", err)
+	}
+	return &record, nil
+}
+
+func loadUpload(tx *gorm.DB, tenantID uint64, uploadID string) (UploadRecord, error) {
+	var record UploadRecord
+	err := tx.Where("tenant_id = ? AND upload_id = ?", tenantID, uploadID).
+		Take(&record).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return record, ErrUploadNotFound
+	}
+	if err != nil {
+		return record, fmt.Errorf("load upload record: %w", err)
+	}
+	return record, nil
+}
+
+// nullTime keeps a zero timestamp out of the database rather than storing year
+// one, which is what a missing Last-Modified from object storage looks like.
+func nullTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
 }
