@@ -103,6 +103,10 @@ type fakeUploadStore struct {
 	mergeFacts   ObjectInfo
 	mergeProduct ProductMetadata
 	failReasons  []string
+
+	lastQuery UploadQuery
+	listErr   error
+	listPage  *UploadPage
 }
 
 var _ UploadStore = (*fakeUploadStore)(nil)
@@ -252,6 +256,22 @@ func (f *fakeUploadStore) FailUploadMerge(
 	record.Status = StatusFailed
 	record.ErrorMessage = reason
 	return record, nil
+}
+
+// ListUploads records the query so tests can assert how the caller's visibility
+// was translated into a filter. The real filtering and paging is the Postgres
+// implementation's business, and is covered there.
+func (f *fakeUploadStore) ListUploads(
+	_ context.Context, query UploadQuery,
+) (*UploadPage, error) {
+	f.lastQuery = query
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.listPage != nil {
+		return f.listPage, nil
+	}
+	return &UploadPage{}, nil
 }
 
 // put seeds both maps; Create and the test fixtures both use it.

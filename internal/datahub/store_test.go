@@ -385,3 +385,110 @@ func TestDatahubCompleteUploadAgainstPostgres(t *testing.T) {
 	_, err = store.FailUploadMerge(ctx, 13, "upload-fail", "again")
 	require.ErrorIs(t, err, ErrUploadNotUploading)
 }
+
+func TestDatahubListUploadsAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	_, store := openTestStore(t, dsn)
+	ctx := context.Background()
+
+	// Three finished uploads across two owners, plus one still in flight.
+	seed := []struct {
+		uploadID string
+		userID   string
+		filename string
+		size     int64
+		status   UploadStatus
+	}{
+		{"list-1", "user-a", "alpha.xlsx", 300, StatusMerged},
+		{"list-2", "user-a", "beta.xlsx", 100, StatusMerged},
+		{"list-3", "user-b", "gamma.xlsx", 200, StatusMerged},
+		{"list-4", "user-a", "in-flight.xlsx", 400, StatusUploading},
+	}
+	for _, item := range seed {
+		record, parts := sampleUpload(20, item.uploadID)
+		record.UserID = item.userID
+		record.Filename = item.filename
+		record.FileSize = item.size
+		record.Status = item.status
+		require.NoError(t, store.Create(ctx, record, parts))
+	}
+
+	// A plain member sees only their own finished uploads.
+	own, err := store.ListUploads(ctx, UploadQuery{
+		TenantID:    20,
+		OwnerUserID: "user-a",
+		Statuses:    []UploadStatus{StatusMerged},
+		Count:       50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), own.Total)
+	require.Len(t, own.Records, 2)
+
+	// An admin sees the whole tenant.
+	all, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, Statuses: []UploadStatus{StatusMerged}, Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(3), all.Total)
+
+	// Without the status filter the in-flight upload shows up too.
+	everything, err := store.ListUploads(ctx, UploadQuery{TenantID: 20, Count: 50})
+	require.NoError(t, err)
+	require.Equal(t, int64(4), everything.Total)
+
+	// Filename search is a case-insensitive substring match.
+	search, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, FileName: "ALPHA", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), search.Total)
+	require.Equal(t, "alpha.xlsx", search.Records[0].Filename)
+
+	// A wildcard typed by the client is a literal, not a match-everything.
+	wildcard, err := store.ListUploads(ctx, UploadQuery{TenantID: 20, FileName: "%", Count: 50})
+	require.NoError(t, err)
+	require.Zero(t, wildcard.Total)
+
+	// Sorting is whitelisted; unknown fields fall back rather than erroring.
+	sorted, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, Statuses: []UploadStatus{StatusMerged}, SortBy: "-file_size", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, sorted.Records, 3)
+	require.Equal(t, int64(300), sorted.Records[0].FileSize)
+	require.Equal(t, int64(100), sorted.Records[2].FileSize)
+
+	fallback, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, SortBy: "-; DROP TABLE datahub_uploads", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(4), fallback.Total)
+
+	// Paging keeps the total independent of the page size.
+	firstPage, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, Statuses: []UploadStatus{StatusMerged}, SortBy: "-file_size",
+		Offset: 0, Count: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(3), firstPage.Total)
+	require.Len(t, firstPage.Records, 1)
+	secondPage, err := store.ListUploads(ctx, UploadQuery{
+		TenantID: 20, Statuses: []UploadStatus{StatusMerged}, SortBy: "-file_size",
+		Offset: 1, Count: 1,
+	})
+	require.NoError(t, err)
+	require.Len(t, secondPage.Records, 1)
+	require.NotEqual(t, firstPage.Records[0].UploadID, secondPage.Records[0].UploadID)
+
+	// Another tenant sees nothing of the above.
+	otherTenant, err := store.ListUploads(ctx, UploadQuery{TenantID: 21, Count: 50})
+	require.NoError(t, err)
+	require.Zero(t, otherTenant.Total)
+}
