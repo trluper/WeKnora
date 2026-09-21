@@ -1,4 +1,4 @@
--- Migration: 000107_datahub_upload_tables
+-- Migration: 000108_datahub_upload_tables
 -- Datahub's upload tables. Datahub is a self-contained module: these tables
 -- belong to it alone, and nothing outside internal/datahub reads or writes
 -- them. See docs/adr/0001-upload-record-merge.md.
@@ -78,7 +78,8 @@ CREATE INDEX IF NOT EXISTS idx_datahub_uploads_expire_at
     ON datahub_uploads (expire_at);
 
 -- Part-registration state for one Upload: a bitmap of which parts arrived plus
--- the protobuf-encoded part metadata, both rewritten under an optimistic lock.
+-- the JSON-encoded part metadata, both rewritten under the row lock that also
+-- serialises concurrent registrations.
 CREATE TABLE IF NOT EXISTS datahub_upload_parts (
     tenant_id       bigint       NOT NULL,
     upload_id       varchar(64)  NOT NULL,
