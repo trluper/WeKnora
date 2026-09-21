@@ -38,6 +38,9 @@ type TestDataStore interface {
 	// ListTestDetails pages one Event's board results, optionally restricted to
 	// one Record owner.
 	ListTestDetails(ctx context.Context, query TestDetailQuery) (*TestDetailPage, error)
+	// RecomputeTestSummaries recounts every Event whose summary disagrees with
+	// its details, up to batchSize Events, and returns how many it corrected.
+	RecomputeTestSummaries(ctx context.Context, batchSize int) (int, error)
 }
 
 // TestSummaryQuery filters and pages Event summaries.
@@ -367,4 +370,84 @@ func (s *postgresTestDataStore) ListTestDetails(
 		return nil, fmt.Errorf("list test details: %w", err)
 	}
 	return page, nil
+}
+
+// mismatchedSummaryQuery finds summaries that disagree with their own details.
+//
+// It compares counts rather than timestamps on purpose. A timestamp rule only
+// catches "a detail changed after the summary was written", which is the common
+// case; it would silently accept a summary whose numbers were corrupted some
+// other way. This comparison is exact, so recomputing genuinely makes the
+// numbers trustworthy again instead of merely plausible.
+//
+// The cost is one aggregate per summary row per run, i.e. proportional to the
+// total number of board results. At the projected 3 million rows a year that is
+// a couple of seconds, run a few times a day — far cheaper than a summary that
+// is quietly wrong.
+const mismatchedSummaryQuery = `
+	WITH counted AS (
+		SELECT tenant_id,
+		       event_id,
+		       count(*)                                        AS total_count,
+		       count(*) FILTER (WHERE test_result = 1)         AS passed_count,
+		       count(*) FILTER (WHERE test_result = 0)         AS failed_count
+		  FROM datahub_test_details
+		 GROUP BY tenant_id, event_id
+	)
+	SELECT s.tenant_id, s.event_id
+	  FROM datahub_test_summaries s
+	  LEFT JOIN counted c
+	    ON c.tenant_id = s.tenant_id AND c.event_id = s.event_id
+	 WHERE (s.total_count, s.passed_count, s.failed_count)
+	       IS DISTINCT FROM
+	       (COALESCE(c.total_count, 0), COALESCE(c.passed_count, 0), COALESCE(c.failed_count, 0))
+	 ORDER BY s.id
+	 LIMIT ?`
+
+// RecomputeTestSummaries is the self-healing backstop for the incremental
+// summary: if a batch ever failed to move the counters, or somebody edited them,
+// this puts them back to what the details actually say.
+//
+// It writes summaries only. Details are read, never touched.
+func (s *postgresTestDataStore) RecomputeTestSummaries(
+	ctx context.Context, batchSize int,
+) (int, error) {
+	var mismatched []struct {
+		TenantID uint64
+		EventID  string
+	}
+	if err := s.db.WithContext(ctx).
+		Raw(mismatchedSummaryQuery, batchSize).
+		Scan(&mismatched).Error; err != nil {
+		return 0, fmt.Errorf("find mismatched test summaries: %w", err)
+	}
+
+	corrected := 0
+	for _, event := range mismatched {
+		// Each Event is counted again inside its own UPDATE, so a summary that
+		// was fixed by a concurrent batch is simply left matching.
+		result := s.db.WithContext(ctx).Exec(`
+			UPDATE datahub_test_summaries s
+			   SET total_count = counted.total_count,
+			       passed_count = counted.passed_count,
+			       failed_count = counted.failed_count,
+			       updated_at = now()
+			  FROM (
+				SELECT count(*)                                AS total_count,
+				       count(*) FILTER (WHERE test_result = 1) AS passed_count,
+				       count(*) FILTER (WHERE test_result = 0) AS failed_count
+				  FROM datahub_test_details
+				 WHERE tenant_id = ? AND event_id = ?
+			  ) counted
+			 WHERE s.tenant_id = ? AND s.event_id = ?`,
+			event.TenantID, event.EventID, event.TenantID, event.EventID,
+		)
+		if result.Error != nil {
+			return corrected, fmt.Errorf("recompute test summary: %w", result.Error)
+		}
+		if result.RowsAffected > 0 {
+			corrected++
+		}
+	}
+	return corrected, nil
 }

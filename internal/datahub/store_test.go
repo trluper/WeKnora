@@ -940,3 +940,101 @@ func TestDatahubReconcileFactsAgainstPostgres(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, keys, "event-1/2026/09/20/facts-no-etag/board-report.xlsx")
 }
+
+func TestDatahubRecomputeTestSummariesAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, _ := openTestStore(t, dsn)
+	store := NewPostgresTestDataStore(db)
+	ctx := context.Background()
+
+	readSummary := func(tenantID uint64, eventID string) TestSummary {
+		t.Helper()
+		var summary TestSummary
+		require.NoError(t, db.Raw(
+			`SELECT * FROM datahub_test_summaries WHERE tenant_id = ? AND event_id = ?`,
+			tenantID, eventID,
+		).Scan(&summary).Error)
+		return summary
+	}
+
+	// A healthy Event, whose summary the incremental path already got right.
+	_, err = store.UpsertTestDetails(ctx, 70, "recompute-healthy", append(
+		makeTestDetails("recompute-healthy", "board", 2, TestResultPassed, "user-a"),
+		makeTestDetails("recompute-healthy", "fail-board", 1, TestResultFailed, "user-a")...,
+	))
+	require.NoError(t, err)
+	healthy := readSummary(70, "recompute-healthy")
+	require.Equal(t, int64(3), healthy.TotalCount)
+
+	// Somebody (or some failed half-run) corrupted this Event's counters.
+	_, err = store.UpsertTestDetails(ctx, 70, "recompute-drifted",
+		makeTestDetails("recompute-drifted", "board", 4, TestResultPassed, "user-b"))
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`
+		UPDATE datahub_test_summaries
+		   SET total_count = 99, passed_count = 42, failed_count = 7
+		 WHERE tenant_id = ? AND event_id = ?`,
+		70, "recompute-drifted",
+	).Error)
+	driftedBefore := readSummary(70, "recompute-drifted")
+	require.Equal(t, int64(99), driftedBefore.TotalCount)
+
+	// A summary row whose details are ALL gone must fall back to zero rather
+	// than keeping numbers nothing supports.
+	require.NoError(t, db.Exec(`
+		INSERT INTO datahub_test_summaries
+			(tenant_id, event_id, total_count, passed_count, failed_count, created_at, updated_at)
+		VALUES (?, ?, 5, 5, 0, now(), now())`, 70, "recompute-detail-less",
+	).Error)
+
+	detailsBefore := countTestDetailsForTenant(t, db, 70)
+
+	corrected, err := store.RecomputeTestSummaries(ctx, 200)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, corrected, 2)
+
+	restored := readSummary(70, "recompute-drifted")
+	require.Equal(t, int64(4), restored.TotalCount)
+	require.Equal(t, int64(4), restored.PassedCount)
+	require.Zero(t, restored.FailedCount)
+	require.True(t, restored.UpdatedAt.After(driftedBefore.UpdatedAt),
+		"a corrected summary records when it was corrected")
+
+	require.Equal(t, int64(0), readSummary(70, "recompute-detail-less").TotalCount,
+		"a summary with no details left is zeroed, not left claiming numbers")
+
+	// Details are only read: the recompute must not rewrite a single board.
+	require.Equal(t, detailsBefore, countTestDetailsForTenant(t, db, 70))
+	var verdict int16
+	require.NoError(t, db.Raw(
+		`SELECT test_result FROM datahub_test_details
+		  WHERE tenant_id = ? AND event_id = ? AND board_id = ?`,
+		70, "recompute-drifted", "board-3",
+	).Scan(&verdict).Error)
+	require.Equal(t, int16(TestResultPassed), verdict)
+
+	// Running again finds the healthy Events already matching and leaves them
+	// alone — including their timestamps.
+	stableBefore := readSummary(70, "recompute-healthy")
+	_, err = store.RecomputeTestSummaries(ctx, 200)
+	require.NoError(t, err)
+	stableAfter := readSummary(70, "recompute-healthy")
+	require.Equal(t, stableBefore.UpdatedAt, stableAfter.UpdatedAt,
+		"a summary that already matches is not rewritten")
+}
+
+func countTestDetailsForTenant(t *testing.T, db *gorm.DB, tenantID uint64) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Raw(
+		`SELECT count(*) FROM datahub_test_details WHERE tenant_id = ?`, tenantID,
+	).Scan(&count).Error)
+	return count
+}
