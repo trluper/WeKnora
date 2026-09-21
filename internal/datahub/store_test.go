@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,4 +197,112 @@ func TestDatahubStoreCreateIsAtomic(t *testing.T) {
 		Where("tenant_id = ? AND upload_id = ?", 9, "upload-atomic-1").
 		Count(&count).Error)
 	require.Equal(t, int64(1), count, "the first, committed parts row is untouched")
+}
+
+func TestDatahubRegisterPartsAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, store := openTestStore(t, dsn)
+	ctx := context.Background()
+
+	upload, parts := sampleUpload(11, "upload-parts")
+	require.NoError(t, store.Create(ctx, upload, parts))
+
+	batch := []CompletedPart{
+		{PartNumber: 1, ETag: "etag-1", Size: 5242880},
+		{PartNumber: 2, ETag: "etag-2", Size: 5242880},
+	}
+	result, err := store.RegisterParts(ctx, 11, "upload-parts", batch)
+	require.NoError(t, err)
+	require.Equal(t, 2, result.CompletedParts)
+	require.Equal(t, 3, result.TotalParts)
+	require.False(t, result.CompletedParts >= result.TotalParts)
+
+	// Replaying the batch must not double count.
+	replayed, err := store.RegisterParts(ctx, 11, "upload-parts", batch)
+	require.NoError(t, err)
+	require.Equal(t, 2, replayed.CompletedParts)
+
+	// The Upload row mirrors the progress so listings do not need a join.
+	stored, err := store.Get(ctx, 11, "upload-parts")
+	require.NoError(t, err)
+	require.Equal(t, 2, stored.CompletedParts)
+
+	// Part metadata survives the round trip, which is what resume relies on.
+	row, err := store.GetParts(ctx, 11, "upload-parts")
+	require.NoError(t, err)
+	entries, err := decodePartMeta(row.PartMeta)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	require.Equal(t, "etag-1", entries[0].ETag)
+	require.True(t, PartBitmapFromBytes(row.PartBitmap).IsSet(1))
+	require.False(t, PartBitmapFromBytes(row.PartBitmap).IsSet(3))
+
+	final, err := store.RegisterParts(ctx, 11, "upload-parts",
+		[]CompletedPart{{PartNumber: 3, ETag: "etag-3", Size: 1024}})
+	require.NoError(t, err)
+	require.True(t, final.CompletedParts >= final.TotalParts, "the last part completes the upload")
+
+	// Once the upload leaves the uploading state, parts are refused.
+	require.NoError(t, db.Exec(
+		`UPDATE datahub_uploads SET status = ? WHERE tenant_id = ? AND upload_id = ?`,
+		StatusMerged, 11, "upload-parts",
+	).Error)
+	_, err = store.RegisterParts(ctx, 11, "upload-parts",
+		[]CompletedPart{{PartNumber: 1, ETag: "etag-1b", Size: 1}})
+	require.ErrorIs(t, err, ErrUploadNotUploading)
+}
+
+func TestDatahubRegisterPartsSerialisesConcurrentBatches(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	_, store := openTestStore(t, dsn)
+	ctx := context.Background()
+
+	upload, parts := sampleUpload(12, "upload-concurrent")
+	upload.TotalParts = 4
+	parts.PartBitmap = NewPartBitmap(4).Bytes()
+	require.NoError(t, store.Create(ctx, upload, parts))
+
+	// Two clients delivering different halves at the same time: the row lock
+	// must serialise them so neither batch is lost.
+	batches := [][]CompletedPart{
+		{{PartNumber: 1, ETag: "e1", Size: 1}, {PartNumber: 2, ETag: "e2", Size: 1}},
+		{{PartNumber: 3, ETag: "e3", Size: 1}, {PartNumber: 4, ETag: "e4", Size: 1}},
+	}
+	errs := make([]error, len(batches))
+	var wg sync.WaitGroup
+	for i, batch := range batches {
+		wg.Add(1)
+		go func(index int, batch []CompletedPart) {
+			defer wg.Done()
+			_, errs[index] = store.RegisterParts(ctx, 12, "upload-concurrent", batch)
+		}(i, batch)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoErrorf(t, err, "batch %d", i)
+	}
+	stored, err := store.Get(ctx, 12, "upload-concurrent")
+	require.NoError(t, err)
+	require.Equal(t, 4, stored.CompletedParts, "no batch was lost to a concurrent write")
+
+	row, err := store.GetParts(ctx, 12, "upload-concurrent")
+	require.NoError(t, err)
+	entries, err := decodePartMeta(row.PartMeta)
+	require.NoError(t, err)
+	require.Len(t, entries, 4)
 }

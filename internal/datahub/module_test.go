@@ -70,6 +70,12 @@ type fakeUploadStore struct {
 	uploads   []*UploadRecord
 	parts     []*UploadParts
 	createErr error
+
+	records       map[string]*UploadRecord
+	partsRows     map[string]*UploadParts
+	registerErr   error
+	registerCalls int
+	lastBatch     []CompletedPart
 }
 
 var _ UploadStore = (*fakeUploadStore)(nil)
@@ -82,13 +88,118 @@ func (f *fakeUploadStore) Create(
 	}
 	f.uploads = append(f.uploads, upload)
 	f.parts = append(f.parts, parts)
+	f.put(upload, parts)
 	return nil
 }
 
 func (f *fakeUploadStore) Get(
-	_ context.Context, _ uint64, _ string,
+	_ context.Context, tenantID uint64, uploadID string,
 ) (*UploadRecord, error) {
+	if record, ok := f.records[uploadID]; ok && record.TenantID == tenantID {
+		return record, nil
+	}
 	return nil, ErrUploadNotFound
+}
+
+func (f *fakeUploadStore) GetParts(
+	_ context.Context, tenantID uint64, uploadID string,
+) (*UploadParts, error) {
+	if row, ok := f.partsRows[uploadID]; ok && row.TenantID == tenantID {
+		return row, nil
+	}
+	return nil, ErrUploadNotFound
+}
+
+// RegisterParts mirrors the real store's contract: already-registered parts are
+// skipped, never duplicated.
+func (f *fakeUploadStore) RegisterParts(
+	_ context.Context, tenantID uint64, uploadID string, parts []CompletedPart,
+) (*RegisterPartsResult, error) {
+	f.registerCalls++
+	f.lastBatch = parts
+	if f.registerErr != nil {
+		return nil, f.registerErr
+	}
+	record, ok := f.records[uploadID]
+	if !ok || record.TenantID != tenantID {
+		return nil, ErrUploadNotFound
+	}
+	row, ok := f.partsRows[uploadID]
+	if !ok {
+		return nil, ErrUploadNotFound
+	}
+	if record.Status != StatusUploading {
+		return nil, ErrUploadNotUploading
+	}
+
+	bitmap := PartBitmapFromBytes(row.PartBitmap)
+	entries, err := decodePartMeta(row.PartMeta)
+	if err != nil {
+		return nil, err
+	}
+	added := 0
+	for _, part := range parts {
+		if bitmap.IsSet(part.PartNumber) {
+			continue
+		}
+		bitmap.Set(part.PartNumber)
+		entries = append(entries, partMetaEntry{
+			PartNumber: part.PartNumber, ETag: part.ETag, Size: part.Size,
+		})
+		added++
+	}
+	if added > 0 {
+		row.PartBitmap = bitmap.Bytes()
+		if row.PartMeta, err = encodePartMeta(entries); err != nil {
+			return nil, err
+		}
+		row.CompletedParts += added
+		if row.CompletedParts > record.TotalParts {
+			row.CompletedParts = record.TotalParts
+		}
+		row.Version++
+	}
+	record.CompletedParts = row.CompletedParts
+	return &RegisterPartsResult{
+		CompletedParts: row.CompletedParts,
+		TotalParts:     record.TotalParts,
+	}, nil
+}
+
+// put seeds both maps; Create and the test fixtures both use it.
+func (f *fakeUploadStore) put(record *UploadRecord, parts *UploadParts) {
+	if f.records == nil {
+		f.records = map[string]*UploadRecord{}
+		f.partsRows = map[string]*UploadParts{}
+	}
+	f.records[record.UploadID] = record
+	f.partsRows[parts.UploadID] = parts
+}
+
+// seedUpload installs an Upload the part flow can act on.
+func seedUpload(
+	store *fakeUploadStore, tenantID uint64, userID string, totalParts int, status UploadStatus,
+) *UploadRecord {
+	record := &UploadRecord{
+		TenantID:   tenantID,
+		UploadID:   "upload-1",
+		EventID:    "event-1",
+		Scenario:   ScenarioExperiment,
+		UserID:     userID,
+		Filename:   "board-report.xlsx",
+		FileSize:   1024,
+		Status:     status,
+		TotalParts: totalParts,
+		PartSize:   defaultPartSize,
+		ExpireAt:   time.Now().UTC().Add(time.Hour),
+	}
+	parts := &UploadParts{
+		TenantID:   tenantID,
+		UploadID:   record.UploadID,
+		PartBitmap: NewPartBitmap(totalParts).Bytes(),
+	}
+	store.put(record, parts)
+	return record
 }
 
 func envFrom(pairs map[string]string) func(string) string {
