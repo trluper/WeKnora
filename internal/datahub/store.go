@@ -104,6 +104,14 @@ type UploadStore interface {
 	// MarkUploadExpired abandons one Upload, recording why. It is idempotent:
 	// an Upload that already left the in-flight states is left alone.
 	MarkUploadExpired(ctx context.Context, tenantID uint64, uploadID, reason string) error
+	// ListUploadsNeedingFacts returns merged Uploads whose object-storage facts
+	// are missing or incomplete, so the reconciler can fill them in.
+	ListUploadsNeedingFacts(ctx context.Context, limit int) ([]UploadRecord, error)
+	// UpdateUploadFacts writes only the object-storage fact columns of one
+	// Upload. Product metadata and the reserved columns are never touched.
+	UpdateUploadFacts(ctx context.Context, tenantID uint64, uploadID string, facts ObjectInfo) error
+	// KnownObjectKeys returns the object keys every recorded Upload points at.
+	KnownObjectKeys(ctx context.Context, limit int) ([]string, error)
 }
 
 // inFlightUploadStatuses are the states an Upload can still be abandoned from.
@@ -494,6 +502,66 @@ func (s *postgresUploadStore) MarkUploadExpired(
 		return fmt.Errorf("mark upload expired: %w", err)
 	}
 	return nil
+}
+
+func (s *postgresUploadStore) ListUploadsNeedingFacts(
+	ctx context.Context, limit int,
+) ([]UploadRecord, error) {
+	var records []UploadRecord
+	err := s.db.WithContext(ctx).
+		Where("status = ?", StatusMerged).
+		Where("etag = '' OR file_size <= 0 OR last_modified IS NULL OR object_key = ''").
+		Order("completed_at ASC NULLS FIRST").
+		Limit(limit).
+		Find(&records).Error
+	if err != nil {
+		return nil, fmt.Errorf("list uploads needing facts: %w", err)
+	}
+	return records, nil
+}
+
+// UpdateUploadFacts is deliberately column-scoped. A reconciler that wrote the
+// whole row would be a second writer for product metadata and for the columns a
+// future summarizer owns, which is exactly what the module's design forbids.
+func (s *postgresUploadStore) UpdateUploadFacts(
+	ctx context.Context, tenantID uint64, uploadID string, facts ObjectInfo,
+) error {
+	err := s.db.WithContext(ctx).Exec(`
+		UPDATE datahub_uploads
+		   SET etag = CASE WHEN ? <> '' THEN ? ELSE etag END,
+		       object_version_id = CASE WHEN ? <> '' THEN ? ELSE object_version_id END,
+		       content_type = CASE WHEN ? <> '' THEN ? ELSE content_type END,
+		       file_size = CASE WHEN ? > 0 THEN ? ELSE file_size END,
+		       last_modified = COALESCE(?, last_modified),
+		       updated_at = ?
+		 WHERE tenant_id = ? AND upload_id = ?`,
+		facts.ETag, facts.ETag,
+		facts.VersionID, facts.VersionID,
+		facts.ContentType, facts.ContentType,
+		facts.Size, facts.Size,
+		nullTime(facts.LastModified),
+		time.Now().UTC(),
+		tenantID, uploadID,
+	).Error
+	if err != nil {
+		return fmt.Errorf("update upload facts: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresUploadStore) KnownObjectKeys(
+	ctx context.Context, limit int,
+) ([]string, error) {
+	var keys []string
+	err := s.db.WithContext(ctx).Model(&UploadRecord{}).
+		Where("object_key <> ''").
+		Order("id").
+		Limit(limit).
+		Pluck("object_key", &keys).Error
+	if err != nil {
+		return nil, fmt.Errorf("list known object keys: %w", err)
+	}
+	return keys, nil
 }
 
 // uploadSortClause turns "‑file_size" / "created_at" into SQL, defaulting to

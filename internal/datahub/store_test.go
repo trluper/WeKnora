@@ -834,3 +834,109 @@ func TestDatahubExpirySweepAgainstPostgres(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StatusUploading, live.Status)
 }
+
+func TestDatahubReconcileFactsAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, store := openTestStore(t, dsn)
+	ctx := context.Background()
+	modified := time.Now().UTC().Add(-time.Hour)
+
+	seed := []struct {
+		uploadID string
+		status   UploadStatus
+		etag     string
+		size     int64
+		modified *time.Time
+	}{
+		{"facts-complete", StatusMerged, "etag-ok", 100, &modified},
+		{"facts-no-etag", StatusMerged, "", 100, &modified},
+		{"facts-no-size", StatusMerged, "etag-2", 0, &modified},
+		{"facts-no-time", StatusMerged, "etag-3", 100, nil},
+		{"facts-inflight", StatusUploading, "", 0, nil},
+	}
+	for _, item := range seed {
+		record, parts := sampleUpload(60, item.uploadID)
+		record.Status = item.status
+		record.ETag = item.etag
+		record.FileSize = item.size
+		record.LastModified = item.modified
+		record.Description = "第三季度报告"
+		record.Category = "sensor"
+		record.Version = "v3"
+		require.NoError(t, store.Create(ctx, record, parts))
+	}
+
+	candidates, err := store.ListUploadsNeedingFacts(ctx, 50)
+	require.NoError(t, err)
+	// The sweep is cross-tenant, and this package's other tests share the
+	// database, so assert on this test's own tenant.
+	own := make([]string, 0, len(candidates))
+	for _, record := range candidates {
+		if record.TenantID != 60 {
+			continue
+		}
+		own = append(own, record.UploadID)
+		require.Contains(t,
+			[]string{"facts-no-etag", "facts-no-size", "facts-no-time"},
+			record.UploadID)
+	}
+	require.ElementsMatch(t,
+		[]string{"facts-no-etag", "facts-no-size", "facts-no-time"}, own,
+		"only merged Uploads with incomplete facts qualify, and never an in-flight one")
+
+	// Filling facts touches the fact columns and nothing else.
+	facts := ObjectInfo{
+		ETag:         "etag-restored",
+		VersionID:    "version-restored",
+		ContentType:  "application/vnd.ms-excel",
+		Size:         2048,
+		LastModified: time.Now().UTC(),
+	}
+	require.NoError(t, store.UpdateUploadFacts(ctx, 60, "facts-no-etag", facts))
+	restored, err := store.Get(ctx, 60, "facts-no-etag")
+	require.NoError(t, err)
+	require.Equal(t, "etag-restored", restored.ETag)
+	require.Equal(t, "version-restored", restored.ObjectVersionID)
+	require.Equal(t, int64(2048), restored.FileSize)
+	require.NotNil(t, restored.LastModified)
+	// Product metadata and the reserved columns are untouched by the reconciler.
+	require.Equal(t, "第三季度报告", restored.Description)
+	require.Equal(t, "sensor", restored.Category)
+	require.Equal(t, "v3", restored.Version)
+	require.Empty(t, restored.SummaryMarkdown)
+	require.Empty(t, restored.AnalysisState)
+
+	var reserved struct {
+		SummaryMarkdown string
+		KeywordCount    int
+	}
+	require.NoError(t, db.Raw(
+		`SELECT summary_markdown, COALESCE(jsonb_array_length(keywords), 0) AS keyword_count
+		 FROM datahub_uploads WHERE tenant_id = ? AND upload_id = ?`,
+		60, "facts-no-etag",
+	).Scan(&reserved).Error)
+	require.Empty(t, reserved.SummaryMarkdown)
+	require.Zero(t, reserved.KeywordCount)
+
+	// Filling the rest empties the candidate list: the sweep is idempotent.
+	for _, uploadID := range []string{"facts-no-size", "facts-no-time"} {
+		require.NoError(t, store.UpdateUploadFacts(ctx, 60, uploadID, facts))
+	}
+	remaining, err := store.ListUploadsNeedingFacts(ctx, 50)
+	require.NoError(t, err)
+	for _, record := range remaining {
+		require.NotEqual(t, uint64(60), record.TenantID,
+			"nothing of this tenant is left to fill")
+	}
+
+	keys, err := store.KnownObjectKeys(ctx, 100)
+	require.NoError(t, err)
+	require.Contains(t, keys, "event-1/2026/09/20/facts-no-etag/board-report.xlsx")
+}
