@@ -767,3 +767,70 @@ func TestDatahubTestDataQueriesAgainstPostgres(t *testing.T) {
 	require.Equal(t, int64(2000), bigSummary.Records[0].TotalCount)
 	require.Equal(t, int64(2000), bigSummary.Records[0].PassedCount)
 }
+
+func TestDatahubExpirySweepAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	_, store := openTestStore(t, dsn)
+	ctx := context.Background()
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	future := time.Now().UTC().Add(2 * time.Hour)
+
+	seed := []struct {
+		uploadID string
+		status   UploadStatus
+		expireAt time.Time
+	}{
+		{"expiry-stale", StatusUploading, past},
+		{"expiry-init", StatusInit, past},
+		{"expiry-merged", StatusMerged, past},
+		{"expiry-live", StatusUploading, future},
+	}
+	for _, item := range seed {
+		record, parts := sampleUpload(50, item.uploadID)
+		record.Status = item.status
+		record.ExpireAt = item.expireAt
+		require.NoError(t, store.Create(ctx, record, parts))
+	}
+
+	expired, err := store.ListExpiredUploads(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 2, "only unfinished Uploads past their expiry are candidates")
+	for _, record := range expired {
+		require.Contains(t, []string{"expiry-stale", "expiry-init"}, record.UploadID)
+	}
+
+	for _, record := range expired {
+		require.NoError(t, store.MarkUploadExpired(
+			ctx, record.TenantID, record.UploadID, "upload expired before it was completed",
+		))
+	}
+
+	// The sweep is idempotent: nothing is left to expire on a second pass.
+	again, err := store.ListExpiredUploads(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Empty(t, again)
+
+	for _, uploadID := range []string{"expiry-stale", "expiry-init"} {
+		record, err := store.Get(ctx, 50, uploadID)
+		require.NoError(t, err)
+		require.Equal(t, StatusCancelled, record.Status)
+		require.Contains(t, record.ErrorMessage, "expired")
+	}
+
+	// A finished Upload past its expiry is not touched, and neither is a live one.
+	merged, err := store.Get(ctx, 50, "expiry-merged")
+	require.NoError(t, err)
+	require.Equal(t, StatusMerged, merged.Status)
+	require.Empty(t, merged.ErrorMessage)
+
+	live, err := store.Get(ctx, 50, "expiry-live")
+	require.NoError(t, err)
+	require.Equal(t, StatusUploading, live.Status)
+}

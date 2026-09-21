@@ -22,6 +22,7 @@ type fakeObjectStore struct {
 	presignErr   error
 	presignCalls int
 	aborted      []string
+	abortErr     error
 
 	storedParts   []CompletedPart
 	listErr       error
@@ -80,7 +81,7 @@ func (f *fakeObjectStore) CompleteMultipartUpload(
 
 func (f *fakeObjectStore) AbortMultipartUpload(_ context.Context, _, _, uploadID string) error {
 	f.aborted = append(f.aborted, uploadID)
-	return nil
+	return f.abortErr
 }
 
 // fakeUploadStore records what the upload flow tried to persist, and can be
@@ -107,6 +108,12 @@ type fakeUploadStore struct {
 	lastQuery UploadQuery
 	listErr   error
 	listPage  *UploadPage
+
+	expired        []UploadRecord
+	expiredErr     error
+	expireCalls    int
+	markedExpired  []string
+	markExpiredErr error
 }
 
 var _ UploadStore = (*fakeUploadStore)(nil)
@@ -272,6 +279,51 @@ func (f *fakeUploadStore) ListUploads(
 		return f.listPage, nil
 	}
 	return &UploadPage{}, nil
+}
+
+// ListExpiredUploads and MarkUploadExpired mirror the real store: listing is
+// cross-tenant and bounded, and marking only touches Uploads still in flight.
+func (f *fakeUploadStore) ListExpiredUploads(
+	_ context.Context, now time.Time, limit int,
+) ([]UploadRecord, error) {
+	if f.expiredErr != nil {
+		return nil, f.expiredErr
+	}
+	// Mirror the real store: only in-flight Uploads past their expiry.
+	expired := make([]UploadRecord, 0, len(f.expired))
+	for _, record := range f.expired {
+		if record.ExpireAt.After(now) {
+			continue
+		}
+		switch record.Status {
+		case StatusInit, StatusUploading, StatusMerging:
+			expired = append(expired, record)
+		}
+	}
+	if len(expired) > limit {
+		expired = expired[:limit]
+	}
+	return expired, nil
+}
+
+func (f *fakeUploadStore) MarkUploadExpired(
+	_ context.Context, _ uint64, uploadID, _ string,
+) error {
+	f.expireCalls++
+	if f.markExpiredErr != nil {
+		return f.markExpiredErr
+	}
+	for i := range f.expired {
+		if f.expired[i].UploadID != uploadID {
+			continue
+		}
+		switch f.expired[i].Status {
+		case StatusInit, StatusUploading, StatusMerging:
+			f.expired[i].Status = StatusCancelled
+			f.markedExpired = append(f.markedExpired, uploadID)
+		}
+	}
+	return nil
 }
 
 // put seeds both maps; Create and the test fixtures both use it.

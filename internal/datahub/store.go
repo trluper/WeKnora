@@ -97,6 +97,18 @@ type UploadStore interface {
 	) (*UploadRecord, error)
 	// ListUploads returns matching Uploads newest-first by default.
 	ListUploads(ctx context.Context, query UploadQuery) (*UploadPage, error)
+	// ListExpiredUploads returns unfinished Uploads whose expiry has passed.
+	// It is deliberately cross-tenant: it serves the background sweep, not a
+	// user request.
+	ListExpiredUploads(ctx context.Context, now time.Time, limit int) ([]UploadRecord, error)
+	// MarkUploadExpired abandons one Upload, recording why. It is idempotent:
+	// an Upload that already left the in-flight states is left alone.
+	MarkUploadExpired(ctx context.Context, tenantID uint64, uploadID, reason string) error
+}
+
+// inFlightUploadStatuses are the states an Upload can still be abandoned from.
+func inFlightUploadStatuses() []UploadStatus {
+	return []UploadStatus{StatusInit, StatusUploading, StatusMerging}
 }
 
 // partMetaEntry is one registered part as stored. The sibling implementation
@@ -448,6 +460,40 @@ func (s *postgresUploadStore) ListUploads(
 		return nil, fmt.Errorf("list uploads: %w", err)
 	}
 	return page, nil
+}
+
+func (s *postgresUploadStore) ListExpiredUploads(
+	ctx context.Context, now time.Time, limit int,
+) ([]UploadRecord, error) {
+	var records []UploadRecord
+	err := s.db.WithContext(ctx).
+		Where("status IN ?", inFlightUploadStatuses()).
+		Where("expire_at < ?", now).
+		// Oldest first, so a long-stalled backlog drains in order.
+		Order("expire_at ASC").
+		Limit(limit).
+		Find(&records).Error
+	if err != nil {
+		return nil, fmt.Errorf("list expired uploads: %w", err)
+	}
+	return records, nil
+}
+
+func (s *postgresUploadStore) MarkUploadExpired(
+	ctx context.Context, tenantID uint64, uploadID, reason string,
+) error {
+	err := s.db.WithContext(ctx).Model(&UploadRecord{}).
+		Where("tenant_id = ? AND upload_id = ? AND status IN ?",
+			tenantID, uploadID, inFlightUploadStatuses()).
+		Updates(map[string]any{
+			"status":     StatusCancelled,
+			"error_msg":  reason,
+			"updated_at": time.Now().UTC(),
+		}).Error
+	if err != nil {
+		return fmt.Errorf("mark upload expired: %w", err)
+	}
+	return nil
 }
 
 // uploadSortClause turns "‑file_size" / "created_at" into SQL, defaulting to
