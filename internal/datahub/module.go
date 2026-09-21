@@ -2,11 +2,13 @@ package datahub
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
@@ -27,6 +29,10 @@ type Module struct {
 	objects  ObjectStore
 	store    UploadStore
 	testData TestDataStore
+	// deadLetters is WeKnora's shared dead-letter repository, so a Datahub task
+	// that exhausts its retries lands where operators already look.
+	deadLetters interfaces.TaskDeadLetterRepository
+	worker      *worker
 }
 
 // Parts are the collaborators a Module runs on. Grouping them keeps the
@@ -37,6 +43,8 @@ type Parts struct {
 	Objects  ObjectStore
 	Store    UploadStore
 	TestData TestDataStore
+
+	DeadLetters interfaces.TaskDeadLetterRepository
 }
 
 // New builds the Datahub module from the deployment environment.
@@ -46,7 +54,11 @@ type Parts struct {
 // mounts nothing. A deployment that *is* configured for it but cannot support
 // it (a non-Postgres database) is a hard startup error rather than a silent
 // no-op.
-func New(db *gorm.DB, redisClient *redis.Client) (*Module, error) {
+func New(
+	db *gorm.DB,
+	redisClient *redis.Client,
+	deadLetters interfaces.TaskDeadLetterRepository,
+) (*Module, error) {
 	settings, err := LoadSettingsFromEnv()
 	if err != nil {
 		return nil, err
@@ -55,7 +67,11 @@ func New(db *gorm.DB, redisClient *redis.Client) (*Module, error) {
 		logger.Infof(context.Background(),
 			"[Datahub] disabled: STORAGE_TYPE=%s is not an S3-compatible object store",
 			settings.StorageType)
-		return newModule(settings, Parts{DB: db, Redis: redisClient}), nil
+		return newModule(settings, Parts{
+			DB:          db,
+			Redis:       redisClient,
+			DeadLetters: deadLetters,
+		}), nil
 	}
 
 	objects, err := NewObjectStore(settings.ObjectStorage)
@@ -65,25 +81,31 @@ func New(db *gorm.DB, redisClient *redis.Client) (*Module, error) {
 	logger.Infof(context.Background(),
 		"[Datahub] enabled: provider=%s bucket=%s",
 		settings.ObjectStorage.Provider, settings.ObjectStorage.Bucket)
-	return newModule(settings, Parts{
-		DB:       db,
-		Redis:    redisClient,
-		Objects:  objects,
-		Store:    NewPostgresUploadStore(db),
-		TestData: NewPostgresTestDataStore(db),
-	}), nil
+	module := newModule(settings, Parts{
+		DB:          db,
+		Redis:       redisClient,
+		Objects:     objects,
+		Store:       NewPostgresUploadStore(db),
+		TestData:    NewPostgresTestDataStore(db),
+		DeadLetters: deadLetters,
+	})
+	if err := module.startBackgroundWorkers(); err != nil {
+		return nil, fmt.Errorf("datahub: failed to start the background worker: %w", err)
+	}
+	return module, nil
 }
 
 // newModule assembles a Module from already-validated parts. Tests inject fakes
 // for the object store and the upload store.
 func newModule(settings Settings, parts Parts) *Module {
 	return &Module{
-		settings: settings,
-		db:       parts.DB,
-		redis:    parts.Redis,
-		objects:  parts.Objects,
-		store:    parts.Store,
-		testData: parts.TestData,
+		settings:    settings,
+		db:          parts.DB,
+		redis:       parts.Redis,
+		objects:     parts.Objects,
+		store:       parts.Store,
+		testData:    parts.TestData,
+		deadLetters: parts.DeadLetters,
 	}
 }
 
