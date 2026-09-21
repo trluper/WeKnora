@@ -474,6 +474,10 @@ type fakeTestDataStore struct {
 	listErr          error
 	lastSummaryQuery TestSummaryQuery
 	lastDetailQuery  TestDetailQuery
+
+	recomputeResult int
+	recomputeErr    error
+	recomputeCalls  int
 }
 
 var _ TestDataStore = (*fakeTestDataStore)(nil)
@@ -557,6 +561,16 @@ func (f *fakeTestDataStore) ListTestDetails(
 		return f.detailPage, nil
 	}
 	return &TestDetailPage{}, nil
+}
+
+func (f *fakeTestDataStore) RecomputeTestSummaries(
+	_ context.Context, _ int,
+) (int, error) {
+	f.recomputeCalls++
+	if f.recomputeErr != nil {
+		return 0, f.recomputeErr
+	}
+	return f.recomputeResult, nil
 }
 
 func envFrom(pairs map[string]string) func(string) string {

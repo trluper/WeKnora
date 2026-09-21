@@ -15,6 +15,8 @@ const (
 	taskTypeExpireUploads = "datahub:expire-uploads"
 	// taskTypeReconcileUploads compares the database against object storage.
 	taskTypeReconcileUploads = "datahub:reconcile-uploads"
+	// taskTypeRecomputeSummaries recounts Event summaries from their details.
+	taskTypeRecomputeSummaries = "datahub:recompute-test-summaries"
 	// queueDatahub is Datahub's own queue. Only Datahub's worker consumes it, so
 	// the module adds no queue to any existing worker pool and cannot change how
 	// the rest of the system schedules work.
@@ -30,6 +32,11 @@ const (
 	reconcileInterval  = 6 * time.Hour
 	reconcileBatchSize = 500
 	reconcileListLimit = 5000
+
+	// The summary is maintained incrementally on every batch; this backstop only
+	// has to bound how long a drift can survive.
+	summaryRecomputeInterval = 6 * time.Hour
+	summaryRecomputeBatch    = 200
 
 	// expiryReason is what an abandoned Upload records, so an operator reading
 	// the row knows nobody failed — the client simply never finished.
@@ -61,6 +68,7 @@ func (m *Module) startBackgroundWorkers() error {
 	mux.Use(asynqdl.MiddlewareWithCallback(m.deadLetters, nil))
 	mux.HandleFunc(taskTypeExpireUploads, m.handleExpireUploads)
 	mux.HandleFunc(taskTypeReconcileUploads, m.handleReconcileUploads)
+	mux.HandleFunc(taskTypeRecomputeSummaries, m.handleRecomputeTestSummaries)
 
 	// Datahub runs on the Redis client the rest of the server already built and
 	// pinged, so pooling, TLS and timeouts match the deployment without this
@@ -93,8 +101,10 @@ func (m *Module) startBackgroundWorkers() error {
 func (m *Module) scheduleSweeps(w *worker) {
 	expiry := time.NewTicker(expirySweepInterval)
 	reconcile := time.NewTicker(reconcileInterval)
+	summaries := time.NewTicker(summaryRecomputeInterval)
 	defer expiry.Stop()
 	defer reconcile.Stop()
+	defer summaries.Stop()
 
 	for {
 		select {
@@ -102,6 +112,8 @@ func (m *Module) scheduleSweeps(w *worker) {
 			m.enqueue(w, taskTypeExpireUploads, expiryMaxRetry)
 		case <-reconcile.C:
 			m.enqueue(w, taskTypeReconcileUploads, expiryMaxRetry)
+		case <-summaries.C:
+			m.enqueue(w, taskTypeRecomputeSummaries, expiryMaxRetry)
 		case <-w.stop:
 			return
 		}

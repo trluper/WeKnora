@@ -117,3 +117,26 @@ func (m *Module) findOrphanObjects(ctx context.Context) (orphans []string, trunc
 
 // reconcileTimeout bounds one reconciliation, which walks object storage.
 const reconcileTimeout = 10 * time.Minute
+
+// handleRecomputeTestSummaries is the self-healing backstop for the incremental
+// Test summary. The incremental update on every batch is exact; this task exists
+// for the cases where it could not run to completion — a failed transaction, a
+// restored database, an operator editing rows — and repairs them without anyone
+// having to notice first.
+func (m *Module) handleRecomputeTestSummaries(ctx context.Context, _ *asynq.Task) error {
+	if m.testData == nil {
+		return errors.New("datahub: test data store is not wired")
+	}
+
+	corrected, err := m.testData.RecomputeTestSummaries(ctx, summaryRecomputeBatch)
+	if err != nil {
+		// Returning the error hands the task back to asynq for a retry.
+		return err
+	}
+	if corrected > 0 {
+		logger.Warnf(ctx,
+			"[Datahub] recomputed %d Event summaries that disagreed with their board results",
+			corrected)
+	}
+	return nil
+}
