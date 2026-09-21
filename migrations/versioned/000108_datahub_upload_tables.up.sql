@@ -52,8 +52,9 @@ CREATE TABLE IF NOT EXISTS datahub_uploads (
     created_at        timestamptz   NOT NULL DEFAULT now(),
     updated_at        timestamptz   NOT NULL DEFAULT now(),
 
-    -- Reserved: no writer today. A future summarizer owns these columns; the
-    -- upload flow must never write them, so a re-run cannot clobber them.
+    -- Reserved for a future summarizer. Only error_msg has a writer today: the
+    -- upload flow records why a merge failed. The upload flow must never write
+    -- the other columns, so a re-run cannot clobber summarizer output.
     summary_markdown  text,
     headline          varchar(512),
     keywords          jsonb,
