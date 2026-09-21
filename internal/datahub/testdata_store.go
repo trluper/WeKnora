@@ -32,6 +32,50 @@ type TestDataStore interface {
 	UpsertTestDetails(
 		ctx context.Context, tenantID uint64, eventID string, rows []TestDetailInput,
 	) (*UpsertTestDetailsResult, error)
+	// ListTestSummaries pages Event summaries, optionally restricted to the
+	// Events one user contributed to.
+	ListTestSummaries(ctx context.Context, query TestSummaryQuery) (*TestSummaryPage, error)
+	// ListTestDetails pages one Event's board results, optionally restricted to
+	// one Record owner.
+	ListTestDetails(ctx context.Context, query TestDetailQuery) (*TestDetailPage, error)
+}
+
+// TestSummaryQuery filters and pages Event summaries.
+type TestSummaryQuery struct {
+	TenantID uint64
+	// EventID, when set, restricts the listing to that one Event.
+	EventID string
+	// ParticipantUserID, when set, restricts the listing to Events this user
+	// recorded at least one board for. Callers that are not tenant admins
+	// always set it; admins leave it empty to see every Event in the tenant.
+	ParticipantUserID string
+	SortBy            string
+	Offset            int
+	Count             int
+}
+
+// TestSummaryPage is one page of Event summaries plus the total match count.
+type TestSummaryPage struct {
+	Total   int64
+	Records []TestSummary
+}
+
+// TestDetailQuery filters and pages one Event's board results.
+type TestDetailQuery struct {
+	TenantID uint64
+	EventID  string
+	// OwnerUserID, when set, restricts the listing to one Record owner. Callers
+	// that are not tenant admins always set it.
+	OwnerUserID string
+	SortBy      string
+	Offset      int
+	Count       int
+}
+
+// TestDetailPage is one page of board results plus the total match count.
+type TestDetailPage struct {
+	Total   int64
+	Records []TestDetail
 }
 
 type postgresTestDataStore struct {
@@ -212,4 +256,115 @@ func summaryDeltas(
 		}
 	}
 	return total, passed, failed
+}
+
+// testSummarySortColumns accepts both the form vocabulary the existing clients
+// send (create_time / update_time) and the column names, so neither has to
+// change. Anything else falls back to newest-first.
+var testSummarySortColumns = map[string]string{
+	"create_time":  "created_at",
+	"created_at":   "created_at",
+	"update_time":  "updated_at",
+	"updated_at":   "updated_at",
+	"total_count":  "total_count",
+	"passed_count": "passed_count",
+	"failed_count": "failed_count",
+	"event_id":     "event_id",
+}
+
+// testDetailSortColumns is the detail listing's equivalent whitelist.
+var testDetailSortColumns = map[string]string{
+	"create_time": "created_at",
+	"created_at":  "created_at",
+	"update_time": "updated_at",
+	"updated_at":  "updated_at",
+	"test_result": "test_result",
+	"board_id":    "board_id",
+}
+
+// sortClause turns a client's sort_by into SQL, restricted to the whitelist.
+func sortClause(columns map[string]string, sortBy, fallback string) string {
+	column, direction := columns[fallback], "DESC"
+	if sortBy == "" {
+		return column + " " + direction
+	}
+	field := sortBy
+	if trimmed, ok := strings.CutPrefix(sortBy, "-"); ok {
+		field = trimmed
+	} else {
+		direction = "ASC"
+	}
+	mapped, ok := columns[field]
+	if !ok {
+		return columns[fallback] + " DESC"
+	}
+	return mapped + " " + direction
+}
+
+func (s *postgresTestDataStore) ListTestSummaries(
+	ctx context.Context, query TestSummaryQuery,
+) (*TestSummaryPage, error) {
+	page := &TestSummaryPage{}
+
+	filter := func(db *gorm.DB) *gorm.DB {
+		db = db.Where("tenant_id = ?", query.TenantID)
+		if query.EventID != "" {
+			db = db.Where("event_id = ?", query.EventID)
+		}
+		if query.ParticipantUserID != "" {
+			// A member sees an Event's overall progress only once they have
+			// recorded something for it.
+			db = db.Where(`
+				EXISTS (
+					SELECT 1 FROM datahub_test_details d
+					 WHERE d.tenant_id = datahub_test_summaries.tenant_id
+					   AND d.event_id = datahub_test_summaries.event_id
+					   AND d.user_id = ?
+				)`, query.ParticipantUserID)
+		}
+		return db
+	}
+
+	if err := filter(s.db.WithContext(ctx).Model(&TestSummary{})).
+		Count(&page.Total).Error; err != nil {
+		return nil, fmt.Errorf("count test summaries: %w", err)
+	}
+	if err := filter(s.db.WithContext(ctx).Model(&TestSummary{})).
+		Order(sortClause(testSummarySortColumns, query.SortBy, "create_time")).
+		Offset(query.Offset).
+		Limit(query.Count).
+		Find(&page.Records).Error; err != nil {
+		return nil, fmt.Errorf("list test summaries: %w", err)
+	}
+	return page, nil
+}
+
+func (s *postgresTestDataStore) ListTestDetails(
+	ctx context.Context, query TestDetailQuery,
+) (*TestDetailPage, error) {
+	page := &TestDetailPage{}
+
+	filter := func(db *gorm.DB) *gorm.DB {
+		// Every index on this table leads with tenant_id, and a detail listing
+		// is always scoped to one Event, so this pair keeps the scan on the
+		// (tenant_id, event_id, created_at) index even at 100 000 boards.
+		db = db.Where("tenant_id = ? AND event_id = ?", query.TenantID, query.EventID)
+		if query.OwnerUserID != "" {
+			db = db.Where("user_id = ?", query.OwnerUserID)
+		}
+		return db
+	}
+
+	if err := filter(s.db.WithContext(ctx).Model(&TestDetail{})).
+		Count(&page.Total).Error; err != nil {
+		return nil, fmt.Errorf("count test details: %w", err)
+	}
+	if err := filter(s.db.WithContext(ctx).Model(&TestDetail{})).
+		Order(sortClause(testDetailSortColumns, query.SortBy, "create_time")).
+		Offset(query.Offset).
+		Limit(query.Count).
+		Find(&page.Records).Error; err != nil {
+		return nil, fmt.Errorf("list test details: %w", err)
+	}
+	return page, nil
 }

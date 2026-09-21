@@ -323,6 +323,12 @@ type fakeTestDataStore struct {
 	err      error
 	calls    int
 	lastRows map[string][]TestDetailInput
+
+	summaryPage      *TestSummaryPage
+	detailPage       *TestDetailPage
+	listErr          error
+	lastSummaryQuery TestSummaryQuery
+	lastDetailQuery  TestDetailQuery
 }
 
 var _ TestDataStore = (*fakeTestDataStore)(nil)
@@ -377,6 +383,35 @@ func (f *fakeTestDataStore) UpsertTestDetails(
 	}
 	f.summary[eventID] = summary
 	return result, nil
+}
+
+// ListTestSummaries and ListTestDetails record the query so tests can assert
+// how the caller's visibility became a filter. The real filtering, paging and
+// sorting is the Postgres implementation's job and is covered there.
+func (f *fakeTestDataStore) ListTestSummaries(
+	_ context.Context, query TestSummaryQuery,
+) (*TestSummaryPage, error) {
+	f.lastSummaryQuery = query
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.summaryPage != nil {
+		return f.summaryPage, nil
+	}
+	return &TestSummaryPage{}, nil
+}
+
+func (f *fakeTestDataStore) ListTestDetails(
+	_ context.Context, query TestDetailQuery,
+) (*TestDetailPage, error) {
+	f.lastDetailQuery = query
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.detailPage != nil {
+		return f.detailPage, nil
+	}
+	return &TestDetailPage{}, nil
 }
 
 func envFrom(pairs map[string]string) func(string) string {

@@ -640,3 +640,130 @@ func makeTestDetails(
 	}
 	return rows
 }
+
+func TestDatahubTestDataQueriesAgainstPostgres(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	migrateToRepoRoot(t)
+
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = m.Close() })
+	migrateUp(t, m)
+
+	db, _ := openTestStore(t, dsn)
+	store := NewPostgresTestDataStore(db)
+	ctx := context.Background()
+
+	// Two Events in tenant 40: one shared by two testers, one belonging to a
+	// single tester, plus an Event in another tenant with the same id.
+	_, err = store.UpsertTestDetails(ctx, 40, "event-shared", append(
+		makeTestDetails("event-shared", "a-board", 10, TestResultPassed, "user-a"),
+		makeTestDetails("event-shared", "b-board", 10, TestResultFailed, "user-a")...,
+	))
+	require.NoError(t, err)
+	_, err = store.UpsertTestDetails(ctx, 40, "event-shared",
+		makeTestDetails("event-shared", "c-board", 10, TestResultPassed, "user-b"))
+	require.NoError(t, err)
+	_, err = store.UpsertTestDetails(ctx, 40, "event-solo",
+		makeTestDetails("event-solo", "d-board", 5, TestResultPassed, "user-c"))
+	require.NoError(t, err)
+	_, err = store.UpsertTestDetails(ctx, 41, "event-shared",
+		makeTestDetails("event-shared", "x-board", 3, TestResultPassed, "user-z"))
+	require.NoError(t, err)
+
+	// Summary: participants see the Events they contributed to.
+	participant, err := store.ListTestSummaries(ctx, TestSummaryQuery{
+		TenantID: 40, ParticipantUserID: "user-b", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), participant.Total)
+	require.Equal(t, "event-shared", participant.Records[0].EventID)
+	require.Equal(t, int64(30), participant.Records[0].TotalCount)
+	require.Equal(t, int64(20), participant.Records[0].PassedCount)
+	require.Equal(t, int64(10), participant.Records[0].FailedCount)
+
+	// A member who recorded nothing for either Event sees nothing.
+	outsider, err := store.ListTestSummaries(ctx, TestSummaryQuery{
+		TenantID: 40, ParticipantUserID: "user-outsider", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Zero(t, outsider.Total)
+
+	// An admin sees every Event in the tenant, and only in that tenant.
+	admin, err := store.ListTestSummaries(ctx, TestSummaryQuery{TenantID: 40, Count: 50})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), admin.Total)
+
+	tenant41, err := store.ListTestSummaries(ctx, TestSummaryQuery{TenantID: 41, Count: 50})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), tenant41.Total)
+	require.Equal(t, int64(3), tenant41.Records[0].TotalCount)
+
+	// Sorting and paging are whitelisted and stable.
+	largest, err := store.ListTestSummaries(ctx, TestSummaryQuery{
+		TenantID: 40, SortBy: "-total_count", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "event-shared", largest.Records[0].EventID)
+	secondPage, err := store.ListTestSummaries(ctx, TestSummaryQuery{
+		TenantID: 40, SortBy: "-total_count", Offset: 1, Count: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), secondPage.Total)
+	require.Len(t, secondPage.Records, 1)
+	require.Equal(t, "event-solo", secondPage.Records[0].EventID)
+
+	// Detail listings: everybody sees their own boards, an admin sees them all.
+	own, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-shared", OwnerUserID: "user-a", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(20), own.Total)
+
+	everyBoard, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-shared", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(30), everyBoard.Total)
+
+	stranger, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-shared", OwnerUserID: "user-outsider", Count: 50,
+	})
+	require.NoError(t, err)
+	require.Zero(t, stranger.Total)
+
+	// Paging keeps the total independent of the page, and ordering is applied.
+	firstPage, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-shared", SortBy: "board_id", Count: 10, Offset: 0,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(30), firstPage.Total)
+	require.Len(t, firstPage.Records, 10)
+	secondDetailPage, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-shared", SortBy: "board_id", Count: 10, Offset: 10,
+	})
+	require.NoError(t, err)
+	require.Len(t, secondDetailPage.Records, 10)
+	require.NotEqual(t, firstPage.Records[0].BoardID, secondDetailPage.Records[0].BoardID)
+	for i := 1; i < len(firstPage.Records); i++ {
+		require.LessOrEqual(t, firstPage.Records[i-1].BoardID, firstPage.Records[i].BoardID)
+	}
+
+	// Volume: an Event of the size this system actually produces still pages
+	// correctly, and the summary is maintained alongside it.
+	_, err = store.UpsertTestDetails(ctx, 40, "event-big",
+		makeTestDetails("event-big", "big-board", 2000, TestResultPassed, "user-a"))
+	require.NoError(t, err)
+	bigPage, err := store.ListTestDetails(ctx, TestDetailQuery{
+		TenantID: 40, EventID: "event-big", Count: 100, Offset: 1990,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2000), bigPage.Total)
+	require.Len(t, bigPage.Records, 10, "the last page holds only what is left")
+	bigSummary, err := store.ListTestSummaries(ctx, TestSummaryQuery{
+		TenantID: 40, EventID: "event-big", Count: 10,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2000), bigSummary.Records[0].TotalCount)
+	require.Equal(t, int64(2000), bigSummary.Records[0].PassedCount)
+}
