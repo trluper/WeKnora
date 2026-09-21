@@ -104,6 +104,18 @@ func TestDatahubEndToEnd(t *testing.T) {
 		"objects live under Datahub's own prefix, got %q", objectKey)
 	require.Contains(t, metadata, "第三季度板件测试报告", "product metadata round-trips")
 
+	// --- multi-part upload, straight to MinIO -----------------------------
+	// S3 requires every part but the last to be at least 5 MiB, so a genuine
+	// multi-part upload has to move real bytes: 5 MiB + 5 MiB + 1 MiB.
+	const mib = 1 << 20
+	multipartKey, multipartSize := e2eMultipartUpload(
+		t, engineA, module, "event-e2e-multipart",
+		[]int{5 * mib, 5 * mib, mib},
+	)
+	require.Equal(t, int64(11*mib), multipartSize,
+		"the merged object is the size of every part together")
+	require.True(t, strings.HasPrefix(multipartKey, objectPrefix))
+
 	// --- visibility -------------------------------------------------------
 	require.NotContains(t, e2eGet(t, engineB, "/api/v1/datahub/upload/versions"), uploadID,
 		"another member of the same tenant must not see this upload")
@@ -162,6 +174,122 @@ func TestDatahubEndToEnd(t *testing.T) {
 
 // e2eUpload drives init -> part PUT -> register -> complete and returns the
 // upload id and its object key.
+// e2eMultipartUpload drives a real multi-part upload: init, one PUT per part
+// straight to object storage, part registration in two batches (with the first
+// batch replayed to prove idempotency), then complete. It returns the object key
+// and the size object storage reports for the merged object.
+func e2eMultipartUpload(
+	t *testing.T, engine *gin.Engine, module *Module, eventID string, partSizes []int,
+) (objectKey string, mergedSize int64) {
+	t.Helper()
+
+	total := 0
+	for _, size := range partSizes {
+		total += size
+	}
+	payload := bytes.Repeat([]byte("b"), total)
+
+	rec := e2ePostRecorder(t, engine, "/api/v1/datahub/upload/init", map[string]any{
+		"filename":     "multipart-report.xlsx",
+		"file_size":    total,
+		"content_type": "application/vnd.ms-excel",
+		"event_id":     eventID,
+		"total_parts":  len(partSizes),
+	})
+	require.Equal(t, http.StatusOK, rec.Code, "init failed: %s", rec.Body.String())
+
+	var initResp struct {
+		Data struct {
+			UploadID      string         `json:"upload_id"`
+			ObjectKey     string         `json:"object_key"`
+			PresignedURLs map[int]string `json:"presigned_urls"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &initResp))
+	require.Len(t, initResp.Data.PresignedURLs, len(partSizes),
+		"init signs every part in one response")
+	uploadID := initResp.Data.UploadID
+	objectKey = initResp.Data.ObjectKey
+
+	// Each part goes straight to object storage, in its own PUT.
+	parts := make([]map[string]any, 0, len(partSizes))
+	offset := 0
+	for index, size := range partSizes {
+		partNumber := index + 1
+		chunk := payload[offset : offset+size]
+		offset += size
+		parts = append(parts, map[string]any{
+			"part_number": partNumber,
+			"etag":        putPart(t, initResp.Data.PresignedURLs[partNumber], chunk),
+			"size":        size,
+		})
+	}
+
+	// Register the first two parts...
+	firstBatch := e2ePostRecorder(t, engine, "/api/v1/datahub/upload/part", map[string]any{
+		"upload_id": uploadID,
+		"parts":     parts[:2],
+	})
+	require.Equal(t, http.StatusOK, firstBatch.Code, "body=%s", firstBatch.Body.String())
+	require.Contains(t, firstBatch.Body.String(), `"completed_parts":2`)
+	require.Contains(t, firstBatch.Body.String(), `"is_complete":false`)
+
+	// ... replay that batch, which must change nothing ...
+	replay := e2ePostRecorder(t, engine, "/api/v1/datahub/upload/part", map[string]any{
+		"upload_id": uploadID,
+		"parts":     parts[:2],
+	})
+	require.Equal(t, http.StatusOK, replay.Code, "body=%s", replay.Body.String())
+	require.Contains(t, replay.Body.String(), `"completed_parts":2`,
+		"re-registering a batch must not double count")
+
+	// ... resume from there: the listing shows exactly what has arrived.
+	resume := e2eGet(t, engine, "/api/v1/datahub/upload/"+uploadID+"/parts")
+	require.Contains(t, resume, `"completed_parts":2`)
+	require.Contains(t, resume, `"total_parts":3`)
+
+	last := e2ePostRecorder(t, engine, "/api/v1/datahub/upload/part", map[string]any{
+		"upload_id": uploadID,
+		"parts":     parts[2:],
+	})
+	require.Equal(t, http.StatusOK, last.Code, "body=%s", last.Body.String())
+	require.Contains(t, last.Body.String(), `"is_complete":true`)
+
+	complete := e2ePostRecorder(t, engine, "/api/v1/datahub/upload/complete", map[string]any{
+		"upload_id":   uploadID,
+		"description": "多分片上传验证",
+		"version":     "v1",
+	})
+	require.Equal(t, http.StatusOK, complete.Code, "complete failed: %s", complete.Body.String())
+	require.Contains(t, complete.Body.String(), `"status":"merged"`)
+
+	// Object storage must hold all of it under one key, with the parts merged in
+	// the right order and nothing dropped.
+	facts, err := module.objects.StatObject(context.Background(),
+		module.settings.ObjectStorage.Bucket, objectKey)
+	require.NoError(t, err)
+	require.Equal(t, int64(total), facts.Size)
+	require.NotEmpty(t, facts.ETag)
+	return objectKey, facts.Size
+}
+
+// putPart uploads one part to its pre-signed URL and returns the ETag object
+// storage assigned, which is what part registration has to carry back.
+func putPart(t *testing.T, url string, payload []byte) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(payload))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "part upload failed")
+
+	etag := resp.Header.Get("ETag")
+	require.NotEmpty(t, etag)
+	return etag
+}
+
 func e2eUpload(
 	t *testing.T, engine *gin.Engine, eventID string, payload []byte,
 ) (uploadID, objectKey string) {
