@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -39,6 +40,29 @@ type ProductMetadata struct {
 	Version      string
 }
 
+// UploadQuery filters and pages an Upload listing.
+type UploadQuery struct {
+	TenantID uint64
+	// OwnerUserID restricts the listing to one Record owner. Callers that are
+	// not tenant admins always set it; admins leave it empty to see the whole
+	// tenant.
+	OwnerUserID string
+	EventID     string
+	FileName    string
+	// Statuses, when non-empty, restricts the listing to those statuses.
+	Statuses []UploadStatus
+	SortBy   string
+	Offset   int
+	Count    int
+}
+
+// UploadPage is one page of an Upload listing plus the total match count, which
+// is what the client needs to page without guessing.
+type UploadPage struct {
+	Total   int64
+	Records []UploadRecord
+}
+
 // UploadStore is the persistence boundary for Upload records. It exists as an
 // interface so the upload flow's behaviour — including its failure paths — can
 // be exercised without a database; the Postgres implementation below is the
@@ -71,6 +95,8 @@ type UploadStore interface {
 	FailUploadMerge(
 		ctx context.Context, tenantID uint64, uploadID string, reason string,
 	) (*UploadRecord, error)
+	// ListUploads returns matching Uploads newest-first by default.
+	ListUploads(ctx context.Context, query UploadQuery) (*UploadPage, error)
 }
 
 // partMetaEntry is one registered part as stored. The sibling implementation
@@ -369,6 +395,87 @@ func (s *postgresUploadStore) FailUploadMerge(
 		return nil, err
 	}
 	return &record, nil
+}
+
+// uploadSortColumns is the whitelist of sortable fields. Anything else falls
+// back to created_at, so a client cannot sort by an arbitrary expression.
+var uploadSortColumns = map[string]string{
+	"upload_id":     "upload_id",
+	"event_id":      "event_id",
+	"user_id":       "user_id",
+	"file_name":     "filename",
+	"file_size":     "file_size",
+	"content_type":  "content_type",
+	"status":        "status",
+	"created_at":    "created_at",
+	"updated_at":    "updated_at",
+	"last_modified": "last_modified",
+}
+
+func (s *postgresUploadStore) ListUploads(
+	ctx context.Context, query UploadQuery,
+) (*UploadPage, error) {
+	page := &UploadPage{}
+
+	filter := func(db *gorm.DB) *gorm.DB {
+		db = db.Where("tenant_id = ?", query.TenantID)
+		if query.OwnerUserID != "" {
+			db = db.Where("user_id = ?", query.OwnerUserID)
+		}
+		if query.EventID != "" {
+			db = db.Where("event_id = ?", query.EventID)
+		}
+		if query.FileName != "" {
+			db = db.Where(`filename ILIKE ? ESCAPE '\'`, "%"+escapeLikePattern(query.FileName)+"%")
+		}
+		if len(query.Statuses) > 0 {
+			db = db.Where("status IN ?", query.Statuses)
+		}
+		return db
+	}
+
+	base := s.db.WithContext(ctx).Model(&UploadRecord{})
+	if err := filter(base.Session(&gorm.Session{})).Count(&page.Total).Error; err != nil {
+		return nil, fmt.Errorf("count uploads: %w", err)
+	}
+
+	records := s.db.WithContext(ctx).Model(&UploadRecord{})
+	records = filter(records.Session(&gorm.Session{})).
+		Order(uploadSortClause(query.SortBy)).
+		Offset(query.Offset).
+		Limit(query.Count)
+	if err := records.Find(&page.Records).Error; err != nil {
+		return nil, fmt.Errorf("list uploads: %w", err)
+	}
+	return page, nil
+}
+
+// uploadSortClause turns "‑file_size" / "created_at" into SQL, defaulting to
+// newest-first.
+func uploadSortClause(sortBy string) string {
+	column := uploadSortColumns["created_at"]
+	direction := "DESC"
+	if sortBy != "" {
+		field := sortBy
+		if trimmed, ok := strings.CutPrefix(sortBy, "-"); ok {
+			field = trimmed
+			direction = "DESC"
+		} else {
+			direction = "ASC"
+		}
+		if mapped, ok := uploadSortColumns[field]; ok {
+			column = mapped
+		} else {
+			column, direction = uploadSortColumns["created_at"], "DESC"
+		}
+	}
+	return column + " " + direction
+}
+
+// escapeLikePattern neutralises the wildcards a client could otherwise smuggle
+// into a search term.
+func escapeLikePattern(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
 }
 
 // lockUpload takes the row lock the merge transitions rely on.

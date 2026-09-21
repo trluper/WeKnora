@@ -96,6 +96,8 @@ func RegisterRoutes(group *gin.RouterGroup, module *Module) {
 	datahub.POST("/upload/part", module.registerUploadParts)
 	datahub.POST("/upload/complete", module.completeUpload)
 	datahub.GET("/upload/:upload_id/parts", module.listUploadParts)
+	datahub.GET("/upload/versions", module.listUploadVersions)
+	datahub.POST("/upload/metadata", module.searchUploadMetadata)
 }
 
 // requireCaller rejects requests that reached the module without an
