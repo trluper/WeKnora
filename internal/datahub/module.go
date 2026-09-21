@@ -103,6 +103,8 @@ func RegisterRoutes(group *gin.RouterGroup, module *Module) {
 	datahub.GET("/upload/versions", module.listUploadVersions)
 	datahub.POST("/upload/metadata", module.searchUploadMetadata)
 	datahub.POST("/test-data/batch-upload", module.uploadTestData)
+	datahub.GET("/test-data/overview-data", module.testDataOverview)
+	datahub.GET("/test-data/detail-data", module.testDataDetails)
 }
 
 // requireCaller rejects requests that reached the module without an
