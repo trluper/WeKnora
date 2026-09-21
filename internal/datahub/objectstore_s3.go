@@ -1,0 +1,166 @@
+package datahub
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"time"
+
+	"github.com/Tencent/WeKnora/internal/utils"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+// partListPageSize is how many parts one ListObjectParts page asks for.
+const partListPageSize = 1000
+
+// s3ObjectStore talks the S3 multipart protocol to whatever S3-compatible
+// endpoint the deployment configured. Datahub owns this client rather than
+// going through WeKnora's FileService, which has no multipart surface — see
+// docs/adr/0004-direct-multipart-upload.md.
+type s3ObjectStore struct {
+	// client signs URLs (a client-level call); core drives the multipart
+	// session (minio-go keeps those on Core rather than Client).
+	client *minio.Client
+	core   *minio.Core
+	bucket string
+}
+
+// NewObjectStore builds the S3/MinIO client for the configured storage.
+//
+// The endpoint goes through WeKnora's SSRF validation exactly like the file
+// service does: a deployment that points object storage at a restricted
+// address is misconfigured, and failing here beats an upload that mysteriously
+// cannot reach its parts.
+func NewObjectStore(settings ObjectStorage) (ObjectStore, error) {
+	endpoint := settings.Endpoint
+	if endpoint == "" {
+		return nil, fmt.Errorf("datahub: %s endpoint is not configured", settings.Provider)
+	}
+	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("datahub: unsafe object storage endpoint %q: %w", endpoint, err)
+	}
+
+	options := &minio.Options{
+		Creds:  credentials.NewStaticV4(settings.AccessKeyID, settings.SecretAccessKey, ""),
+		Secure: settings.UseSSL,
+		Region: settings.Region,
+		Transport: &utils.SSRFValidatingRoundTripper{
+			Base: utils.NewSSRFSafeTransport(utils.DefaultSSRFSafeHTTPClientConfig()),
+		},
+	}
+	client, err := minio.New(endpoint, options)
+	if err != nil {
+		return nil, fmt.Errorf("datahub: failed to initialize object storage client: %w", err)
+	}
+	core, err := minio.NewCore(endpoint, options)
+	if err != nil {
+		return nil, fmt.Errorf("datahub: failed to initialize object storage multipart client: %w", err)
+	}
+
+	return &s3ObjectStore{client: client, core: core, bucket: settings.Bucket}, nil
+}
+
+func (s *s3ObjectStore) CreateMultipartUpload(
+	ctx context.Context, bucket, objectKey string,
+) (string, error) {
+	uploadID, err := s.core.NewMultipartUpload(
+		ctx, s.bucketName(bucket), objectKey, minio.PutObjectOptions{},
+	)
+	if err != nil {
+		return "", fmt.Errorf("create multipart upload: %w", err)
+	}
+	return uploadID, nil
+}
+
+// PresignUploadPart signs PUT /<object>?uploadId=…&partNumber=N, the S3
+// multipart part-upload form the client already speaks.
+func (s *s3ObjectStore) PresignUploadPart(
+	ctx context.Context,
+	bucket, objectKey, uploadID string,
+	partNumber int,
+	ttl time.Duration,
+) (string, error) {
+	params := url.Values{}
+	params.Set("uploadId", uploadID)
+	params.Set("partNumber", strconv.Itoa(partNumber))
+
+	signed, err := s.client.Presign(
+		ctx, http.MethodPut, s.bucketName(bucket), objectKey, ttl, params,
+	)
+	if err != nil {
+		return "", fmt.Errorf("presign part %d: %w", partNumber, err)
+	}
+	return signed.String(), nil
+}
+
+func (s *s3ObjectStore) CompletedParts(
+	ctx context.Context, bucket, objectKey, uploadID string,
+) ([]CompletedPart, error) {
+	var parts []CompletedPart
+	marker := 0
+	for {
+		page, err := s.core.ListObjectParts(
+			ctx, s.bucketName(bucket), objectKey, uploadID, marker, partListPageSize,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list upload parts: %w", err)
+		}
+		for _, part := range page.ObjectParts {
+			parts = append(parts, CompletedPart{
+				PartNumber: part.PartNumber,
+				ETag:       part.ETag,
+				Size:       part.Size,
+			})
+		}
+		if !page.IsTruncated {
+			return parts, nil
+		}
+		marker = page.NextPartNumberMarker
+	}
+}
+
+func (s *s3ObjectStore) CompleteMultipartUpload(
+	ctx context.Context, bucket, objectKey, uploadID string, parts []CompletedPart,
+) (ObjectInfo, error) {
+	completeParts := make([]minio.CompletePart, 0, len(parts))
+	for _, part := range parts {
+		completeParts = append(completeParts, minio.CompletePart{
+			PartNumber: part.PartNumber,
+			ETag:       part.ETag,
+		})
+	}
+
+	info, err := s.core.CompleteMultipartUpload(
+		ctx, s.bucketName(bucket), objectKey, uploadID, completeParts, minio.PutObjectOptions{},
+	)
+	if err != nil {
+		return ObjectInfo{}, fmt.Errorf("complete multipart upload: %w", err)
+	}
+	return ObjectInfo{
+		ETag:         info.ETag,
+		VersionID:    info.VersionID,
+		Size:         info.Size,
+		LastModified: info.LastModified,
+	}, nil
+}
+
+func (s *s3ObjectStore) AbortMultipartUpload(
+	ctx context.Context, bucket, objectKey, uploadID string,
+) error {
+	if err := s.core.AbortMultipartUpload(
+		ctx, s.bucketName(bucket), objectKey, uploadID,
+	); err != nil {
+		return fmt.Errorf("abort multipart upload: %w", err)
+	}
+	return nil
+}
+
+func (s *s3ObjectStore) bucketName(bucket string) string {
+	if bucket != "" {
+		return bucket
+	}
+	return s.bucket
+}

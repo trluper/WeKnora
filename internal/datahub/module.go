@@ -25,6 +25,16 @@ type Module struct {
 	db       *gorm.DB
 	redis    *redis.Client
 	objects  ObjectStore
+	store    UploadStore
+}
+
+// Parts are the collaborators a Module runs on. Grouping them keeps the
+// constructor readable as later tickets add to it.
+type Parts struct {
+	DB      *gorm.DB
+	Redis   *redis.Client
+	Objects ObjectStore
+	Store   UploadStore
 }
 
 // New builds the Datahub module from the deployment environment.
@@ -43,27 +53,33 @@ func New(db *gorm.DB, redisClient *redis.Client) (*Module, error) {
 		logger.Infof(context.Background(),
 			"[Datahub] disabled: STORAGE_TYPE=%s is not an S3-compatible object store",
 			settings.StorageType)
-	} else {
-		logger.Infof(context.Background(),
-			"[Datahub] enabled: provider=%s bucket=%s",
-			settings.ObjectStorage.Provider, settings.ObjectStorage.Bucket)
+		return newModule(settings, Parts{DB: db, Redis: redisClient}), nil
 	}
-	return newModule(settings, db, redisClient, nil), nil
+
+	objects, err := NewObjectStore(settings.ObjectStorage)
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof(context.Background(),
+		"[Datahub] enabled: provider=%s bucket=%s",
+		settings.ObjectStorage.Provider, settings.ObjectStorage.Bucket)
+	return newModule(settings, Parts{
+		DB:      db,
+		Redis:   redisClient,
+		Objects: objects,
+		Store:   NewPostgresUploadStore(db),
+	}), nil
 }
 
-// newModule assembles a Module from already-validated parts. objects is nil
-// until the S3 client lands; tests inject a fake here.
-func newModule(
-	settings Settings,
-	db *gorm.DB,
-	redisClient *redis.Client,
-	objects ObjectStore,
-) *Module {
+// newModule assembles a Module from already-validated parts. Tests inject fakes
+// for the object store and the upload store.
+func newModule(settings Settings, parts Parts) *Module {
 	return &Module{
 		settings: settings,
-		db:       db,
-		redis:    redisClient,
-		objects:  objects,
+		db:       parts.DB,
+		redis:    parts.Redis,
+		objects:  parts.Objects,
+		store:    parts.Store,
 	}
 }
 
@@ -76,6 +92,7 @@ func RegisterRoutes(group *gin.RouterGroup, module *Module) {
 	datahub := group.Group(routePrefix)
 	datahub.Use(requireCaller())
 	datahub.GET("/health", module.health)
+	datahub.POST("/upload/init", module.initUpload)
 }
 
 // requireCaller rejects requests that reached the module without an

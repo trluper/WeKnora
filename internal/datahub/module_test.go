@@ -3,6 +3,7 @@ package datahub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,10 +15,13 @@ import (
 )
 
 // fakeObjectStore stands in for MinIO/S3 so the upload flow can be exercised
-// without object storage. Later tickets drive it; for now it proves the port is
-// injectable and that the module reports what it is wired to.
+// without object storage. Its failure hooks drive the abort paths.
 type fakeObjectStore struct {
-	created bool
+	created      bool
+	createErr    error
+	presignErr   error
+	presignCalls int
+	aborted      []string
 }
 
 var _ ObjectStore = (*fakeObjectStore)(nil)
@@ -25,6 +29,9 @@ var _ ObjectStore = (*fakeObjectStore)(nil)
 func (f *fakeObjectStore) CreateMultipartUpload(
 	_ context.Context, _, _ string,
 ) (string, error) {
+	if f.createErr != nil {
+		return "", f.createErr
+	}
 	f.created = true
 	return "fake-multipart-id", nil
 }
@@ -32,7 +39,11 @@ func (f *fakeObjectStore) CreateMultipartUpload(
 func (f *fakeObjectStore) PresignUploadPart(
 	_ context.Context, _, _, _ string, partNumber int, _ time.Duration,
 ) (string, error) {
-	return "https://object-storage.invalid/part/" + itoa(partNumber), nil
+	if f.presignErr != nil {
+		return "", f.presignErr
+	}
+	f.presignCalls++
+	return fmt.Sprintf("https://object-storage.invalid/part/%d", partNumber), nil
 }
 
 func (f *fakeObjectStore) CompletedParts(
@@ -47,20 +58,37 @@ func (f *fakeObjectStore) CompleteMultipartUpload(
 	return ObjectInfo{ETag: "fake-etag"}, nil
 }
 
-func (f *fakeObjectStore) AbortMultipartUpload(_ context.Context, _, _, _ string) error {
+func (f *fakeObjectStore) AbortMultipartUpload(_ context.Context, _, _, uploadID string) error {
+	f.aborted = append(f.aborted, uploadID)
 	return nil
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+// fakeUploadStore records what the upload flow tried to persist, and can be
+// told to fail so the "database write failed" abort path is testable without a
+// database.
+type fakeUploadStore struct {
+	uploads   []*UploadRecord
+	parts     []*UploadParts
+	createErr error
+}
+
+var _ UploadStore = (*fakeUploadStore)(nil)
+
+func (f *fakeUploadStore) Create(
+	_ context.Context, upload *UploadRecord, parts *UploadParts,
+) error {
+	if f.createErr != nil {
+		return f.createErr
 	}
-	var digits []byte
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits)
+	f.uploads = append(f.uploads, upload)
+	f.parts = append(f.parts, parts)
+	return nil
+}
+
+func (f *fakeUploadStore) Get(
+	_ context.Context, _ uint64, _ string,
+) (*UploadRecord, error) {
+	return nil, ErrUploadNotFound
 }
 
 func envFrom(pairs map[string]string) func(string) string {
@@ -199,7 +227,7 @@ func get(t *testing.T, engine *gin.Engine, path string) *httptest.ResponseRecord
 }
 
 func TestHealthRejectsUnauthenticatedCaller(t *testing.T) {
-	engine := newTestEngine(newModule(enabledSettings(), nil, nil, &fakeObjectStore{}), nil)
+	engine := newTestEngine(newModule(enabledSettings(), Parts{Objects: &fakeObjectStore{}}), nil)
 
 	rec := get(t, engine, "/api/v1/datahub/health")
 
@@ -207,7 +235,7 @@ func TestHealthRejectsUnauthenticatedCaller(t *testing.T) {
 }
 
 func TestHealthReportsDependencyState(t *testing.T) {
-	module := newModule(enabledSettings(), nil, nil, &fakeObjectStore{})
+	module := newModule(enabledSettings(), Parts{Objects: &fakeObjectStore{}})
 	engine := newTestEngine(module, &types.Caller{TenantID: 7, UserID: "user-1"})
 
 	rec := get(t, engine, "/api/v1/datahub/health")
@@ -248,7 +276,7 @@ func TestHealthReportsDependencyState(t *testing.T) {
 }
 
 func TestHealthReportsUnwiredObjectStore(t *testing.T) {
-	module := newModule(enabledSettings(), nil, nil, nil)
+	module := newModule(enabledSettings(), Parts{})
 	engine := newTestEngine(module, &types.Caller{TenantID: 7, UserID: "user-1"})
 
 	rec := get(t, engine, "/api/v1/datahub/health")
@@ -261,7 +289,7 @@ func TestHealthReportsUnwiredObjectStore(t *testing.T) {
 func TestRegisterRoutesSkipsDisabledModule(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	disabled := newModule(Settings{StorageType: defaultStorageType}, nil, nil, nil)
+	disabled := newModule(Settings{StorageType: defaultStorageType}, Parts{})
 
 	RegisterRoutes(engine.Group("/api/v1"), disabled)
 	RegisterRoutes(engine.Group("/api/v1"), nil)
