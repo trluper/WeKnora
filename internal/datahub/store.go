@@ -552,6 +552,7 @@ func (s *postgresUploadStore) UpdateUploadFacts(
 func (s *postgresUploadStore) KnownObjectKeys(
 	ctx context.Context, limit int,
 ) ([]string, error) {
+	//SELECT object_key FROM upload_records WHERE object_key <> '' ORDER BY id LIMIT limit
 	var keys []string
 	err := s.db.WithContext(ctx).Model(&UploadRecord{}).
 		Where("object_key <> ''").

@@ -182,9 +182,13 @@ func (s *s3ObjectStore) ListObjects(
 	ctx context.Context, bucket, prefix string, limit int,
 ) ([]ObjectRef, bool, error) {
 	objects := make([]ObjectRef, 0, 64)
-	truncated := false
 
-	for object := range s.client.ListObjects(ctx, s.bucketName(bucket), minio.ListObjectsOptions{
+	// ListObjectsIter rather than the channel-returning ListObjects, on purpose:
+	// minio runs the channel form on a goroutine that only stops once the
+	// consumer drains it to the close, so stopping early — at limit, or on the
+	// first error — leaves that goroutine parked on its channel for good. The
+	// iterator form stops where the caller stops and spawns nothing.
+	for object := range s.client.ListObjectsIter(ctx, s.bucketName(bucket), minio.ListObjectsOptions{
 		Prefix:    prefix,
 		Recursive: true,
 	}) {
@@ -192,8 +196,9 @@ func (s *s3ObjectStore) ListObjects(
 			return nil, false, fmt.Errorf("list objects under %s: %w", prefix, object.Err)
 		}
 		if limit > 0 && len(objects) >= limit {
-			truncated = true
-			break
+			// The caller asked for at most limit objects; this is the whole
+			// answer as far as it is concerned.
+			return objects, true, nil
 		}
 		objects = append(objects, ObjectRef{
 			Key:          object.Key,
@@ -202,7 +207,16 @@ func (s *s3ObjectStore) ListObjects(
 			ETag:         object.ETag,
 		})
 	}
-	return objects, truncated, nil
+
+	// The listing ran out without reaching limit. If the context was cancelled
+	// along the way, the pages never fetched make this a partial listing, and
+	// reporting it as a complete one would let a reconciler read "nothing left
+	// in the bucket" into a listing it never finished. ListObjectsIter stops
+	// silently on cancellation, where the channel form surfaced ctx.Err().
+	if err := ctx.Err(); err != nil {
+		return nil, false, fmt.Errorf("list objects under %s: %w", prefix, err)
+	}
+	return objects, false, nil
 }
 
 // isNoSuchKey recognises a missing object across the error shapes minio-go
