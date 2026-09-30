@@ -129,20 +129,11 @@ func (s *postgresTestDataStore) UpsertTestDetails(
 			INSERT INTO datahub_test_summaries
 				(tenant_id, event_id, total_count, passed_count, failed_count, created_at, updated_at)
 			VALUES (?, ?, 0, 0, 0, ?, ?)
-			ON CONFLICT (tenant_id, event_id) DO NOTHING`,
+			ON CONFLICT (tenant_id, event_id) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
 			tenantID, eventID, now, now,
 		).Error; err != nil {
 			return fmt.Errorf("ensure test summary: %w", err)
 		}
-		var summaryID int64
-		if err := tx.Raw(`
-			SELECT id FROM datahub_test_summaries
-			 WHERE tenant_id = ? AND event_id = ? FOR UPDATE`,
-			tenantID, eventID,
-		).Scan(&summaryID).Error; err != nil {
-			return fmt.Errorf("lock test summary: %w", err)
-		}
-
 		// 2. Read the verdicts these boards already had.
 		previous, err := previousVerdicts(tx, tenantID, eventID, deduped)
 		if err != nil {
